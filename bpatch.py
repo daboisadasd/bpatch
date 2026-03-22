@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 bpatch - static binary injection tool for malware analysis
-Supports: ELF x86-64 (Linux/Android), PE x86-64 (Windows)
+Supports: ELF x86-64/aarch64 (Linux/Android), PE x86-64 (Windows)
 Auto-detects format from the binary.
 
 Usage:
@@ -14,6 +14,7 @@ deps:  pip install lief capstone keystone-engine
 import argparse
 import os
 import platform
+import re
 import shutil
 import struct
 import subprocess
@@ -33,10 +34,8 @@ def _require(mod, pkg):
 lief    = _require("lief",    "lief")
 _require("capstone",  "capstone")
 _require("keystone",  "keystone")
-
-import capstone
-import capstone.x86
-import keystone
+from bpatch_arch import aarch64 as backend_aarch64
+from bpatch_arch import x86_64 as backend_x86_64
 
 
 # ==============================================================================
@@ -275,20 +274,160 @@ int _bp_strcmp(const char *a, const char *b) {
  *              +0x1C=AddressOfFunctions, +0x20=AddressOfNames,
  *              +0x24=AddressOfNameOrdinals
  */
+/*
+ * _bp_get_proc: walk PE export table and return function pointer.
+ *
+ * Handles FORWARDED EXPORTS: on modern Windows many kernel32 exports are
+ * forwarded to kernelbase.dll (e.g. CreateFileA -> KERNELBASE.CreateFileA).
+ * A forwarded RVA falls inside the export directory itself (not in .text).
+ * We detect this and recursively resolve through the forward chain.
+ *
+ * Forward string format: "DLL.FunctionName" or "DLL.#ordinal"
+ * Resolution is recursive so multi-hop forward chains are handled.
+ */
+/* Forward declarations for recursive forwarded-export resolution */
+static __attribute__((always_inline)) inline
+void *_bp_get_proc(void *base, const char *name);
+static __attribute__((always_inline)) inline
+void *_bp_get_proc_by_ordinal(void *base, u32 ordinal);
+
+/*
+ * _bp_get_proc_by_ordinal: find export by ordinal index directly.
+ * Handles forwarded ordinals recursively (e.g. "KERNELBASE.#123").
+ */
+static __attribute__((always_inline)) inline
+void *_bp_get_proc_by_ordinal(void *base, u32 ordinal) {
+    u8  *b       = (u8*)base;
+    u32  lfanew  = *(u32*)(b + 0x3C);
+    u32  exp_rva = *(u32*)(b + lfanew + 0x18 + 0x70);
+    u32  exp_sz  = *(u32*)(b + lfanew + 0x18 + 0x74);
+    if (!exp_rva) return (void*)0;
+    u8  *exp     = b + exp_rva;
+    u32  base_ord = *(u32*)(exp + 0x10);   /* OrdinalBase (usually 1) */
+    u32  nfuncs   = *(u32*)(exp + 0x14);
+    u32 *funcs    = (u32*)(b + *(u32*)(exp + 0x1C));
+    u32  idx      = ordinal - base_ord;
+    if (idx >= nfuncs) return (void*)0;
+    u32 fn_rva = funcs[idx];
+
+    /* Forwarded export: "DLL.Func" or "DLL.#Ord" */
+    if (fn_rva >= exp_rva && fn_rva < exp_rva + exp_sz) {
+        const char *fwd = (const char*)(b + fn_rva);
+        const char *dot = fwd;
+        while (*dot && *dot != '.') dot++;
+        if (!*dot) return (void*)0;
+        int dlen = (int)(dot - fwd);
+
+        bp_wchar dll_name[64];
+        if (dlen > 58) return (void*)0;
+        for (int j = 0; j < dlen; j++) dll_name[j] = (bp_wchar)(u8)fwd[j];
+
+        int has_ext = (dlen >= 4 &&
+            (fwd[dlen-4] == '.') &&
+            (fwd[dlen-3] == 'd' || fwd[dlen-3] == 'D') &&
+            (fwd[dlen-2] == 'l' || fwd[dlen-2] == 'L') &&
+            (fwd[dlen-1] == 'l' || fwd[dlen-1] == 'L'));
+        if (!has_ext) {
+            dll_name[dlen+0] = '.'; dll_name[dlen+1] = 'd';
+            dll_name[dlen+2] = 'l'; dll_name[dlen+3] = 'l';
+            dll_name[dlen+4] = 0;
+            dlen += 4;
+        } else {
+            dll_name[dlen] = 0;
+        }
+
+        void *fwd_base = _bp_get_module(dll_name, dlen * 2);
+        if (!fwd_base) return (void*)0;
+
+        const char *sym = dot + 1;
+        if (*sym == '#') {
+            u32 ord = 0;
+            int have_digit = 0;
+            sym++;
+            while (*sym >= '0' && *sym <= '9') {
+                ord = ord * 10 + (u32)(*sym - '0');
+                sym++;
+                have_digit = 1;
+            }
+            if (!have_digit) return (void*)0;
+            return _bp_get_proc_by_ordinal(fwd_base, ord);
+        }
+        return _bp_get_proc(fwd_base, sym);
+    }
+    return (void*)(b + fn_rva);
+}
+
 static __attribute__((always_inline)) inline
 void *_bp_get_proc(void *base, const char *name) {
     u8  *b       = (u8*)base;
     u32  lfanew  = *(u32*)(b + 0x3C);
     u32  exp_rva = *(u32*)(b + lfanew + 0x18 + 0x70);
+    u32  exp_sz  = *(u32*)(b + lfanew + 0x18 + 0x74);
     if (!exp_rva) return (void*)0;
     u8  *exp     = b + exp_rva;
     u32  nnames  = *(u32*)(exp + 0x18);
     u32 *names   = (u32*)(b + *(u32*)(exp + 0x20));
     u16 *ords    = (u16*)(b + *(u32*)(exp + 0x24));
     u32 *funcs   = (u32*)(b + *(u32*)(exp + 0x1C));
-    for (u32 i = 0; i < nnames; i++)
-        if (_bp_strcmp((char*)(b + names[i]), name) == 0)
-            return (void*)(b + funcs[ords[i]]);
+    for (u32 i = 0; i < nnames; i++) {
+        if (_bp_strcmp((char*)(b + names[i]), name) == 0) {
+            u32 fn_rva = funcs[ords[i]];
+            /* RVA inside export directory = forwarded export */
+            if (fn_rva >= exp_rva && fn_rva < exp_rva + exp_sz) {
+                /* Forward string format: "DLLNAME.FuncName" or "DLLNAME.#ordinal" */
+                const char *fwd = (const char*)(b + fn_rva);
+                /* Find the separating dot */
+                const char *dot = fwd;
+                while (*dot && *dot != '.') dot++;
+                if (!*dot) return (void*)0;
+                int dlen = (int)(dot - fwd);
+
+                /* Build wide DLL name.
+                 * 64 wide chars handles names up to 59 chars + ".dll" + null.
+                 * Real-world longest: "api-ms-win-core-synch-l1-2-0" = 28 chars. */
+                bp_wchar dll_name[64];
+                if (dlen > 58) return (void*)0;  /* unreasonably long, bail */
+                for (int j = 0; j < dlen; j++) dll_name[j] = (bp_wchar)(u8)fwd[j];
+
+                /* Append ".dll" if the name doesn't already end in it.
+                 * Check all 4 chars of the extension correctly. */
+                int has_ext = (dlen >= 4 &&
+                    (fwd[dlen-4] == '.') &&
+                    (fwd[dlen-3] == 'd' || fwd[dlen-3] == 'D') &&
+                    (fwd[dlen-2] == 'l' || fwd[dlen-2] == 'L') &&
+                    (fwd[dlen-1] == 'l' || fwd[dlen-1] == 'L'));
+                if (!has_ext) {
+                    dll_name[dlen+0] = '.'; dll_name[dlen+1] = 'd';
+                    dll_name[dlen+2] = 'l'; dll_name[dlen+3] = 'l';
+                    dll_name[dlen+4] = 0;
+                    dlen += 4;
+                } else {
+                    dll_name[dlen] = 0;
+                }
+
+                void *fwd_base = _bp_get_module(dll_name, dlen * 2);
+                if (!fwd_base) return (void*)0;
+
+                const char *sym = dot + 1;
+                /* Ordinal forward: "DLL.#123" */
+                if (*sym == '#') {
+                    u32 ord = 0;
+                    int have_digit = 0;
+                    sym++;
+                    while (*sym >= '0' && *sym <= '9') {
+                        ord = ord * 10 + (u32)(*sym - '0');
+                        sym++;
+                        have_digit = 1;
+                    }
+                    if (!have_digit) return (void*)0;
+                    return _bp_get_proc_by_ordinal(fwd_base, ord);
+                }
+                /* Named forward */
+                return _bp_get_proc(fwd_base, sym);
+            }
+            return (void*)(b + fn_rva);
+        }
+    }
     return (void*)0;
 }
 
@@ -352,6 +491,168 @@ static inline void dump_ctx(ctx_t *c, const char *path) { dump_bytes(c,sizeof(ct
 #define LOG_REG(name,reg,path)          do{ char _l[]=name": "; dump_str_append(_l,path); dump_u64((u64)(reg),path); }while(0)
 """
 
+BPATCH_RT_AARCH64_LINUX_H = r"""
+#pragma once
+/* bpatch_rt.h - Linux/Android AArch64 (AAPCS64) - generated by bpatch */
+
+typedef unsigned char       u8;
+typedef unsigned short      u16;
+typedef unsigned int        u32;
+typedef unsigned long long  u64;
+typedef long long           i64;
+
+/*
+ * Register context layout produced by ARM64 backend:
+ *   x0..x30, then nzcv (all 8-byte fields)
+ */
+typedef struct {
+    u64 x0;   u64 x1;   u64 x2;   u64 x3;
+    u64 x4;   u64 x5;   u64 x6;   u64 x7;
+    u64 x8;   u64 x9;   u64 x10;  u64 x11;
+    u64 x12;  u64 x13;  u64 x14;  u64 x15;
+    u64 x16;  u64 x17;  u64 x18;  u64 x19;
+    u64 x20;  u64 x21;  u64 x22;  u64 x23;
+    u64 x24;  u64 x25;  u64 x26;  u64 x27;
+    u64 x28;  u64 x29;  u64 x30;
+    u64 nzcv;
+} ctx_t;
+
+/* Raw register access */
+#define X0    (ctx->x0)
+#define X1    (ctx->x1)
+#define X2    (ctx->x2)
+#define X3    (ctx->x3)
+#define X4    (ctx->x4)
+#define X5    (ctx->x5)
+#define X6    (ctx->x6)
+#define X7    (ctx->x7)
+#define X8    (ctx->x8)
+#define X9    (ctx->x9)
+#define X10   (ctx->x10)
+#define X11   (ctx->x11)
+#define X12   (ctx->x12)
+#define X13   (ctx->x13)
+#define X14   (ctx->x14)
+#define X15   (ctx->x15)
+#define X16   (ctx->x16)
+#define X17   (ctx->x17)
+#define X18   (ctx->x18)
+#define X19   (ctx->x19)
+#define X20   (ctx->x20)
+#define X21   (ctx->x21)
+#define X22   (ctx->x22)
+#define X23   (ctx->x23)
+#define X24   (ctx->x24)
+#define X25   (ctx->x25)
+#define X26   (ctx->x26)
+#define X27   (ctx->x27)
+#define X28   (ctx->x28)
+#define X29   (ctx->x29)
+#define X30   (ctx->x30)
+#define NZCV  (ctx->nzcv)
+
+/* AAPCS64 args: x0..x7 */
+#define ARG1   (ctx->x0)
+#define ARG2   (ctx->x1)
+#define ARG3   (ctx->x2)
+#define ARG4   (ctx->x3)
+#define ARG5   (ctx->x4)
+#define ARG6   (ctx->x5)
+#define ARG7   (ctx->x6)
+#define ARG8   (ctx->x7)
+#define RETVAL (ctx->x0)
+
+#define ARG1_PTR(t) ((t *)(ctx->x0))
+#define ARG2_PTR(t) ((t *)(ctx->x1))
+#define ARG3_PTR(t) ((t *)(ctx->x2))
+#define X0_PTR(t)   ((t *)(ctx->x0))
+#define X1_PTR(t)   ((t *)(ctx->x1))
+#define X2_PTR(t)   ((t *)(ctx->x2))
+
+/* -- No-libc syscall wrappers (AArch64 Linux ABI) -------------------------- */
+static __attribute__((always_inline)) inline
+long _bp_sc1(long n, long a0) {
+    register long x0 __asm__("x0") = a0;
+    register long x8 __asm__("x8") = n;
+    __asm__ volatile ("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+static __attribute__((always_inline)) inline
+long _bp_sc3(long n, long a0, long a1, long a2) {
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x8 __asm__("x8") = n;
+    __asm__ volatile ("svc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x8) : "memory");
+    return x0;
+}
+static __attribute__((always_inline)) inline
+long _bp_sc4(long n, long a0, long a1, long a2, long a3) {
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    register long x8 __asm__("x8") = n;
+    __asm__ volatile ("svc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3), "r"(x8) : "memory");
+    return x0;
+}
+
+/* Linux AArch64 syscall numbers */
+#define _BP_NR_OPENAT 56
+#define _BP_NR_CLOSE  57
+#define _BP_NR_WRITE  64
+
+/* openat flags/mode */
+#define _BP_AT_FDCWD  (-100)
+#define _BP_O_WRONLY  1
+#define _BP_O_CREAT   0100
+#define _BP_O_TRUNC   01000
+#define _BP_O_APPEND  02000
+#define _BP_MODE_0644 0644
+
+static inline long _bp_open_trunc(const char *path) {
+    return _bp_sc4(_BP_NR_OPENAT, _BP_AT_FDCWD, (long)path,
+                   _BP_O_WRONLY|_BP_O_CREAT|_BP_O_TRUNC, _BP_MODE_0644);
+}
+static inline long _bp_open_append(const char *path) {
+    return _bp_sc4(_BP_NR_OPENAT, _BP_AT_FDCWD, (long)path,
+                   _BP_O_WRONLY|_BP_O_CREAT|_BP_O_APPEND, _BP_MODE_0644);
+}
+static inline long _bp_write(long fd, const void *buf, u32 len) {
+    return _bp_sc3(_BP_NR_WRITE, fd, (long)buf, (long)len);
+}
+static inline void _bp_close(long fd) { _bp_sc1(_BP_NR_CLOSE, fd); }
+
+/* -- Helpers --------------------------------------------------------------- */
+static inline u32 bp_strlen(const char *s) { u32 n=0; while(s[n]) n++; return n; }
+
+static inline void dump_bytes(const void *d, u32 len, const char *path) {
+    long fd = _bp_open_trunc(path);
+    if (fd < 0) return;
+    _bp_write(fd, d, len);
+    _bp_close(fd);
+}
+static inline void dump_append(const void *d, u32 len, const char *path) {
+    long fd = _bp_open_append(path);
+    if (fd < 0) return;
+    _bp_write(fd, d, len);
+    _bp_close(fd);
+}
+static inline void dump_str(const char *s, const char *path)        { dump_bytes(s, bp_strlen(s), path); }
+static inline void dump_str_append(const char *s, const char *path) { dump_append(s, bp_strlen(s), path); }
+static inline void dump_u64(u64 v, const char *path) {
+    char buf[19]; buf[0]='0'; buf[1]='x';
+    for(int i=0;i<16;i++){u8 n=(u8)((v>>(60-i*4))&0xF); buf[2+i]=n<10?'0'+n:'a'+(n-10);}
+    buf[18]='\n'; dump_append(buf,19,path);
+}
+static inline void dump_ctx(ctx_t *c, const char *path) { dump_bytes(c,sizeof(ctx_t),path); }
+
+/* NOTE: use  char arr[] = "..."  not  char *p = "..."  for string literals. */
+#define DUMP_STR_REG(reg,path)          dump_str((const char*)(u64)(reg),(path))
+#define DUMP_BYTES_REG(reg,len,path)    dump_bytes((const void*)(u64)(reg),(u32)(len),(path))
+#define LOG_REG(name,reg,path)          do{ char _l[]=name": "; dump_str_append(_l,path); dump_u64((u64)(reg),path); }while(0)
+"""
+
 
 # ==============================================================================
 #  PAYLOAD COMPILATION
@@ -377,17 +678,187 @@ SECTIONS {
 """
 
 
-def _find_toolchain(pe: bool) -> tuple[str, str, str]:
-    """Return (gcc, ld, objcopy) for the appropriate toolchain."""
-    if not pe:
-        for t in ("gcc", "ld", "objcopy"):
-            if not shutil.which(t):
-                print(f"[!] {t} not found in PATH"); sys.exit(1)
-        return "gcc", "ld", "objcopy"
+def _resolve_exe(candidate: str) -> str:
+    """Resolve an executable name or path to a runnable path; return '' if not found."""
+    if not candidate:
+        return ""
 
-    # PE target
+    p = Path(candidate)
+    if p.is_file():
+        return str(p)
+
+    w = shutil.which(candidate)
+    if w:
+        return w
+
+    has_sep = (os.path.sep in candidate) or (os.path.altsep and os.path.altsep in candidate)
+    if has_sep and platform.system() == "Windows":
+        for ext in (".exe", ".cmd", ".bat"):
+            q = Path(candidate + ext)
+            if q.is_file():
+                return str(q)
+    return ""
+
+
+def _resolve_near(exe_path: str, names: tuple[str, ...]) -> str:
+    """
+    Resolve one of `names`, preferring binaries in the same directory as exe_path.
+    Returns '' when none are found.
+    """
+    base_dir = Path(exe_path).parent if exe_path else None
+    for name in names:
+        if base_dir:
+            local = _resolve_exe(str(base_dir / name))
+            if local:
+                return local
+        found = _resolve_exe(name)
+        if found:
+            return found
+    return ""
+
+
+def _extract_android_api_from_name(name: str) -> int:
+    m = re.search(r"aarch64-linux-android(\d+)-clang", name)
+    return int(m.group(1)) if m else -1
+
+
+def _find_ndk_aarch64_toolchain():
+    """
+    Locate an Android NDK-style aarch64 toolchain:
+      aarch64-linux-android<api>-clang + ld.lld + llvm-objcopy
+    Returns (cc, ld, objcopy) or None.
+    """
+    host_tag = {
+        "Windows": "windows-x86_64",
+        "Linux": "linux-x86_64",
+        "Darwin": "darwin-x86_64",
+    }.get(platform.system(), "")
+
+    ndk_roots: list[Path] = []
+    for env_name in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "NDK_HOME"):
+        v = os.environ.get(env_name, "").strip()
+        if v:
+            p = Path(v)
+            if p.exists():
+                ndk_roots.append(p)
+
+    seen: set[str] = set()
+    uniq_roots: list[Path] = []
+    for r in ndk_roots:
+        k = str(r.resolve())
+        if k not in seen:
+            seen.add(k)
+            uniq_roots.append(r)
+
+    if host_tag:
+        for root in uniq_roots:
+            bin_dir = root / "toolchains" / "llvm" / "prebuilt" / host_tag / "bin"
+            if not bin_dir.is_dir():
+                continue
+
+            wrappers: list[Path] = []
+            for p in bin_dir.glob("aarch64-linux-android*-clang*"):
+                low = p.name.lower()
+                if "clang++" in low:
+                    continue
+                if p.is_file():
+                    wrappers.append(p)
+            wrappers.sort(key=lambda p: _extract_android_api_from_name(p.name))
+
+            for cc_path in reversed(wrappers):
+                cc = str(cc_path)
+                ld_ = _resolve_near(cc, ("ld.lld", "lld"))
+                oc = _resolve_near(cc, ("llvm-objcopy", "objcopy"))
+                if ld_ and oc:
+                    return cc, ld_, oc
+
+    # PATH fallback for common API levels (highest first)
+    for api in (35, 34, 33, 32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21):
+        cc = _resolve_exe(f"aarch64-linux-android{api}-clang")
+        if not cc:
+            continue
+        ld_ = _resolve_near(cc, ("ld.lld", "lld"))
+        oc = _resolve_near(cc, ("llvm-objcopy", "objcopy"))
+        if ld_ and oc:
+            return cc, ld_, oc
+
+    return None
+
+
+def _auto_toolchain(pe: bool, arch: str) -> tuple[str, str, str]:
+    """Return (gcc, ld, objcopy) for the requested format/arch."""
+    if not pe:
+        if arch == "x86_64":
+            for t in ("gcc", "ld", "objcopy"):
+                if not shutil.which(t):
+                    print(f"[!] {t} not found in PATH")
+                    sys.exit(1)
+            return "gcc", "ld", "objcopy"
+
+        if arch == "aarch64":
+            # Optional explicit overrides:
+            #   BPATCH_AARCH64_CC=/path/to/cc
+            #   BPATCH_AARCH64_LD=/path/to/ld
+            #   BPATCH_AARCH64_OBJCOPY=/path/to/objcopy
+            cc_override = os.environ.get("BPATCH_AARCH64_CC", "").strip()
+            if cc_override:
+                cc = _resolve_exe(cc_override)
+                if not cc:
+                    print(f"[!] BPATCH_AARCH64_CC not found: {cc_override}")
+                    sys.exit(1)
+                ld_ov = os.environ.get("BPATCH_AARCH64_LD", "").strip()
+                oc_ov = os.environ.get("BPATCH_AARCH64_OBJCOPY", "").strip()
+                ld_ = _resolve_exe(ld_ov) if ld_ov else _resolve_near(cc, ("ld", "ld.lld"))
+                oc = _resolve_exe(oc_ov) if oc_ov else _resolve_near(cc, ("objcopy", "llvm-objcopy"))
+                if ld_ and oc:
+                    return cc, ld_, oc
+                print("[!] Could not resolve linker/objcopy for BPATCH_AARCH64_CC.")
+                print("    Set BPATCH_AARCH64_LD and BPATCH_AARCH64_OBJCOPY explicitly.")
+                sys.exit(1)
+
+            # Optional override: e.g. BPATCH_AARCH64_PREFIX=aarch64-linux-gnu-
+            pfx = os.environ.get("BPATCH_AARCH64_PREFIX", "").strip()
+            prefixes = [pfx] if pfx else []
+            prefixes += [
+                "aarch64-linux-gnu-",
+                "aarch64-none-linux-gnu-",
+                "aarch64-unknown-linux-gnu-",
+                "aarch64-linux-android-",
+            ]
+            for prefix in prefixes:
+                gcc = _resolve_exe(prefix + "gcc")
+                ld_ = _resolve_exe(prefix + "ld")
+                oc = _resolve_exe(prefix + "objcopy")
+                if gcc and ld_ and oc:
+                    return gcc, ld_, oc
+
+            ndk_tc = _find_ndk_aarch64_toolchain()
+            if ndk_tc:
+                return ndk_tc
+
+            print("[!] Could not find an AArch64 ELF toolchain.")
+            print("    Looked for prefixes:")
+            print("      aarch64-linux-gnu-")
+            print("      aarch64-none-linux-gnu-")
+            print("      aarch64-unknown-linux-gnu-")
+            print("      aarch64-linux-android-")
+            print("    Looked for Android NDK clang wrappers too:")
+            print("      aarch64-linux-android<api>-clang")
+            print("    You can set one of:")
+            print("      BPATCH_AARCH64_PREFIX")
+            print("      BPATCH_AARCH64_CC / BPATCH_AARCH64_LD / BPATCH_AARCH64_OBJCOPY")
+            sys.exit(1)
+
+        print(f"[!] Unsupported ELF architecture: {arch}")
+        sys.exit(1)
+
+    # PE target (x86-64 only for now)
+    if arch != "x86_64":
+        print(f"[!] PE {arch} is not supported yet. Only PE x86_64 is supported.")
+        sys.exit(1)
+
     prefix = "" if platform.system() == "Windows" else "x86_64-w64-mingw32-"
-    gcc, ld_, oc = prefix+"gcc", prefix+"ld", prefix+"objcopy"
+    gcc, ld_, oc = prefix + "gcc", prefix + "ld", prefix + "objcopy"
     for t in (gcc, ld_, oc):
         if not shutil.which(t):
             if platform.system() == "Windows":
@@ -401,7 +872,85 @@ def _find_toolchain(pe: bool) -> tuple[str, str, str]:
     return gcc, ld_, oc
 
 
-def compile_payload(c_file: Path, tmpdir: Path, pe: bool = False) -> bytes:
+def _prefer_by_cc(cc: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """
+    Return preferred (ld candidates, objcopy candidates) based on compiler flavor.
+    Clang pairs best with lld/llvm-objcopy; GCC pairs best with ld/objcopy.
+    """
+    cc_name = Path(cc).name.lower()
+    if "clang" in cc_name:
+        return ("ld.lld", "lld", "ld"), ("llvm-objcopy", "objcopy")
+    return ("ld", "ld.lld", "lld"), ("objcopy", "llvm-objcopy")
+
+
+def _find_toolchain(pe: bool, arch: str,
+                    cc_override: str = "",
+                    ld_override: str = "",
+                    objcopy_override: str = "") -> tuple[str, str, str]:
+    """
+    Resolve payload toolchain.
+    Overrides allow easy switching between gcc/clang or custom wrappers:
+      --cc / --ld / --objcopy
+    """
+    cc = ""
+    if cc_override:
+        cc = _resolve_exe(cc_override)
+        if not cc:
+            print(f"[!] --cc not found: {cc_override}")
+            sys.exit(1)
+
+    ld = ""
+    if ld_override:
+        ld = _resolve_exe(ld_override)
+        if not ld:
+            print(f"[!] --ld not found: {ld_override}")
+            sys.exit(1)
+    elif cc:
+        ld_names, _ = _prefer_by_cc(cc)
+        ld = _resolve_near(cc, ld_names)
+
+    oc = ""
+    if objcopy_override:
+        oc = _resolve_exe(objcopy_override)
+        if not oc:
+            print(f"[!] --objcopy not found: {objcopy_override}")
+            sys.exit(1)
+    elif cc:
+        _, oc_names = _prefer_by_cc(cc)
+        oc = _resolve_near(cc, oc_names)
+
+    # Fill any unresolved pieces from the default toolchain discovery.
+    if not cc or not ld or not oc:
+        auto_cc, auto_ld, auto_oc = _auto_toolchain(pe, arch)
+        if not cc:
+            cc = auto_cc
+        if not ld:
+            if not ld_override:
+                ld_names, _ = _prefer_by_cc(cc)
+                ld = _resolve_near(cc, ld_names) or auto_ld
+            else:
+                ld = auto_ld
+        if not oc:
+            if not objcopy_override:
+                _, oc_names = _prefer_by_cc(cc)
+                oc = _resolve_near(cc, oc_names) or auto_oc
+            else:
+                oc = auto_oc
+
+    if not ld or not oc:
+        print("[!] Failed to resolve payload linker/objcopy.")
+        print("    Provide explicit values with --ld and --objcopy.")
+        sys.exit(1)
+
+    return cc, ld, oc
+
+
+def compile_payload(c_file: Path, tmpdir: Path, pe: bool = False,
+                    arch: str = "x86_64",
+                    cc_override: str = "",
+                    ld_override: str = "",
+                    objcopy_override: str = "",
+                    payload_opt: str = "O2") -> tuple[bytes, int]:
     """
     Compile user C payload -> self-contained flat binary blob.
 
@@ -412,7 +961,19 @@ def compile_payload(c_file: Path, tmpdir: Path, pe: bool = False) -> bytes:
     RIP-relative loads from .text into .rodata are self-contained and
     correct regardless of injection address.
     """
-    rt = BPATCH_RT_WIN64_H if pe else BPATCH_RT_LINUX_H
+    if pe:
+        if arch != "x86_64":
+            print(f"[!] PE payload runtime for arch {arch} is not supported.")
+            sys.exit(1)
+        rt = BPATCH_RT_WIN64_H
+    else:
+        if arch == "x86_64":
+            rt = BPATCH_RT_LINUX_H
+        elif arch == "aarch64":
+            rt = BPATCH_RT_AARCH64_LINUX_H
+        else:
+            print(f"[!] ELF payload runtime for arch {arch} is not supported.")
+            sys.exit(1)
     (tmpdir / "bpatch_rt.h").write_text(rt, encoding='utf-8')
     (tmpdir / "payload.ld").write_text(_LINKER_SCRIPT, encoding='utf-8')
 
@@ -424,24 +985,35 @@ def compile_payload(c_file: Path, tmpdir: Path, pe: bool = False) -> bytes:
     obj    = tmpdir / "payload.o"
     linked = tmpdir / "payload_linked"
     binf   = tmpdir / "payload.bin"
-    gcc, ld_, oc = _find_toolchain(pe)
+    cc, ld_, oc = _find_toolchain(pe, arch, cc_override, ld_override, objcopy_override)
+    print(f"[*] payload toolchain: cc={cc}  ld={ld_}  objcopy={oc}  opt=-{payload_opt}")
 
-    flags = ["-O2", "-fPIC", "-ffreestanding", "-fno-builtin",
-             "-fno-stack-protector", "-fcf-protection=none",
-             "-mno-sse", "-mno-sse2",   # prevent movdqa for stack strings
-             "-nostdlib"]
-    if not pe:
-        flags.append("-mno-red-zone")   # Linux SysV only
+    opt_flag = "-" + payload_opt
+    flags = [opt_flag, "-fPIC", "-ffreestanding", "-fno-builtin",
+             "-fno-stack-protector", "-nostdlib"]
+    if arch == "x86_64":
+        flags.append("-fcf-protection=none")
+        flags += ["-mno-sse", "-mno-sse2"]  # prevent movdqa for stack strings
+        if not pe:
+            flags.append("-mno-red-zone")   # Linux SysV only
 
     r = subprocess.run(
-        [gcc] + flags + ["-I", str(tmpdir), "-c", str(tmpdir/"payload.c"), "-o", str(obj)],
+        [cc] + flags + ["-I", str(tmpdir), "-c", str(tmpdir/"payload.c"), "-o", str(obj)],
         capture_output=True, text=True)
     if r.returncode != 0:
         print("[!] Compilation failed:\n" + r.stderr); sys.exit(1)
 
     # Check for undefined symbols (will crash at injection time)
-    nm_bin = (("x86_64-w64-mingw32-" if pe and platform.system()!="Windows" else "") + "nm")
-    if not shutil.which(nm_bin): nm_bin = "nm"
+    cc_name = Path(cc).name
+    tool_prefix = cc_name[:-3] if cc_name.endswith("gcc") else ""
+    nm_candidates: list[str] = []
+    if tool_prefix:
+        nm_candidates.append(tool_prefix + "nm")
+    nm_candidates += ["llvm-nm", "nm"]
+    nm_bin = _resolve_near(cc, tuple(nm_candidates))
+    if not nm_bin:
+        print("[!] Could not find nm/llvm-nm for payload symbol lookup.")
+        sys.exit(1)
     nm = subprocess.run([nm_bin, str(obj)], capture_output=True, text=True)
     undef = [l.strip() for l in nm.stdout.splitlines() if " U " in l]
     if undef:
@@ -450,8 +1022,14 @@ def compile_payload(c_file: Path, tmpdir: Path, pe: bool = False) -> bytes:
         sys.exit(1)
 
     # Check for bad relocations (PLT/GOT = unresolvable external call)
-    re_bin = (("x86_64-w64-mingw32-" if pe and platform.system()!="Windows" else "") + "readelf")
-    if not shutil.which(re_bin): re_bin = "readelf"
+    re_candidates: list[str] = []
+    if tool_prefix:
+        re_candidates.append(tool_prefix + "readelf")
+    re_candidates += ["llvm-readelf", "readelf"]
+    re_bin = _resolve_near(cc, tuple(re_candidates))
+    if not re_bin:
+        print("[!] Could not find readelf/llvm-readelf for relocation check.")
+        sys.exit(1)
     relf = subprocess.run([re_bin, "-r", str(obj)], capture_output=True, text=True)
     bad = [l.strip() for l in relf.stdout.splitlines() if "PLT32" in l or "GOTPCREL" in l]
     if bad:
@@ -468,206 +1046,46 @@ def compile_payload(c_file: Path, tmpdir: Path, pe: bool = False) -> bytes:
 
     subprocess.run([oc, "-O", "binary", str(linked), str(binf)], check=True)
     data = binf.read_bytes().rstrip(b"\x00") + b"\x00"
-    print(f"[+] payload compiled: {len(data)} bytes  (text+rodata flat binary)")
-    return data
+
+    # Find the offset of payload() within the flat binary.
+    # The compiler does NOT guarantee payload() is first in .text -- helpers
+    # defined in the runtime header (or as static functions in the payload file)
+    # may be emitted before payload().  The prologue calls this offset, so
+    # getting it wrong means we call a helper instead of the user's function.
+    payload_offset = _find_payload_offset(nm_bin, obj)
+    print(f"[+] payload compiled: {len(data)} bytes  "
+          f"(text+rodata flat binary, payload() at +0x{payload_offset:x})")
+    return data, payload_offset
 
 
-# ==============================================================================
-#  INSTRUCTION STEALING + FIXUP
-# ==============================================================================
-
-MIN_STEAL = 5   # bytes for rel32 JMP (E9 xx xx xx xx)
-
-def steal_insns(raw: bytes, target_va: int, sec_va: int, sec_foff: int):
-    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
-    md.detail = True
-    foff  = sec_foff + (target_va - sec_va)
-    code  = raw[foff : foff + 64]
-    insns, total = [], 0
-    for ins in md.disasm(code, target_va):
-        insns.append(ins); total += ins.size
-        if total >= MIN_STEAL: break
-    if total < MIN_STEAL:
-        print(f"[!] Only {total} bytes at 0x{target_va:x}, need {MIN_STEAL}"); sys.exit(1)
-    print(f"[+] stealing {total} bytes ({len(insns)} instrs) from 0x{target_va:x}:")
-    for i in insns: print(f"    0x{i.address:x}:  {i.mnemonic:10s} {i.op_str}")
-    return insns, total
-
-
-def fixup_insns(insns, dst_va: int) -> bytes:
-    """Re-encode stolen instructions for their new location dst_va."""
-    out = b""; off = 0
-    for ins in insns:
-        raw = bytes(ins.bytes); new = raw; idst = dst_va + off; fixed = False
-        # RIP-relative memory
-        for op in ins.operands:
-            if op.type == capstone.x86.X86_OP_MEM and op.mem.base == capstone.x86.X86_REG_RIP:
-                abs_t = ins.address + ins.size + op.mem.disp
-                nd    = abs_t - (idst + ins.size)
-                if not (-(1<<31) <= nd <= (1<<31)-1):
-                    print(f"[!] RIP-rel overflow at 0x{ins.address:x}"); sys.exit(1)
-                new = raw[:-4] + struct.pack("<i", nd)
-                print(f"    fixup rip-rel @ 0x{ins.address:x}: {op.mem.disp:+#x} -> {nd:+#x}")
-                fixed = True; break
-        if not fixed:
-            b0 = raw[0]
-            if b0 in (0xE8, 0xE9) and len(raw) == 5:
-                abs_t = ins.address + ins.size + struct.unpack("<i", raw[1:5])[0]
-                nr    = abs_t - (idst + 5)
-                new   = bytes([b0]) + (struct.pack("<i", nr) if -(1<<31)<=nr<=(1<<31)-1
-                        else b"\xFF\x25\x00\x00\x00\x00" + struct.pack("<Q", abs_t))[1:]
-                if -(1<<31) <= nr <= (1<<31)-1:
-                    new = bytes([b0]) + struct.pack("<i", nr)
-                else:
-                    new = b"\xFF\x25\x00\x00\x00\x00" + struct.pack("<Q", abs_t)
-                print(f"    fixup rel32 @ 0x{ins.address:x}: -> 0x{abs_t:x}")
-            elif b0 == 0xEB and len(raw) == 2:
-                abs_t = ins.address + 2 + struct.unpack("b", raw[1:2])[0]
-                nr8   = abs_t - (idst + 2)
-                new   = bytes([0xEB, nr8&0xFF]) if -(1<<7)<=nr8<=(1<<7)-1 \
-                        else bytes([0xE9]) + struct.pack("<i", abs_t-(idst+5))
-                print(f"    fixup short jmp @ 0x{ins.address:x}: -> 0x{abs_t:x}")
-        out += new; off += len(new)
-    return out
-
-
-# ==============================================================================
-#  PROLOGUE / EPILOGUE
-# ==============================================================================
-
-def build_section_content(inject_va: int, payload_bytes: bytes,
-                           stolen_insns, return_va: int,
-                           abi: str = "sysv") -> tuple[bytes, bytes, bytes]:
+def _find_payload_offset(nm_bin: str, obj: Path) -> int:
     """
-    Build the injected section:  [ prologue ][ epilogue ][ payload ]
-
-    The call at the end of the prologue pushes (epilogue start) as return address,
-    so payload's ret falls straight into the epilogue - no extra trampoline needed.
-
-    Stack alignment (both ABIs guarantee payload entry rsp%16==8 so that
-    payload's own sub rsp,N can re-align):
-
-    SysV - function entry rsp%16=8:
-        sub  rsp, 136      -> clears 128-byte red zone + 8-byte pad, rsp%16=0
-        pushfq             -> rsp%16=8
-        push *15 (r15..rax)-> rsp%16=8-(15*8)%16=8-8=0
-        mov  rdi, rsp      -> ctx = rsp, rdi=&ctx
-        call payload       -> rsp inside payload = orig-272, %16=8  OK
-
-    Win64 - function entry rsp%16=8, no red zone:
-        pushfq             -> rsp%16=0
-        push *15 (r15..rax)-> rsp%16=0-(15*8)%16=0-8==8 mod 16
-        mov  rcx, rsp      -> ctx = rsp (rax is at rsp+0, rflags at rsp+120)
-        sub  rsp, 40       -> 32 shadow + 8 align, rsp%16=8-40%16=8-8=0
-        call payload       -> rsp inside payload = orig-176, %16=8  OK
+    Use nm to find the file offset of payload() within the .text section.
+    Returns the byte offset from the start of the flat binary to payload().
+    Exits with an error if payload() is not found.
     """
-    ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+    nm = subprocess.run([nm_bin, str(obj)], capture_output=True, text=True)
+    for line in nm.stdout.splitlines():
+        # nm output: "<offset> T payload" or "<offset> t payload"
+        parts = line.strip().split()
+        if len(parts) == 3 and parts[1].upper() == "T" and parts[2] == "payload":
+            offset = int(parts[0], 16)
+            if offset != 0:
+                print(f"[*] payload() is at .text+0x{offset:x} "
+                      f"(not offset 0 -- helpers emitted first)")
+            return offset
+    print("[!] Could not find payload() symbol in compiled object.")
+    print("    Make sure your payload file defines:  void payload() { ... }")
+    sys.exit(1)
 
-    if abi == "sysv":
-        PBODY = """\
-            sub  rsp, 136
-            pushfq
-            push r15
-            push r14
-            push r13
-            push r12
-            push r11
-            push r10
-            push r9
-            push r8
-            push rbp
-            push rdi
-            push rsi
-            push rdx
-            push rcx
-            push rbx
-            push rax
-            mov  rdi, rsp
-        """
-        RBODY = """\
-            pop  rax
-            pop  rbx
-            pop  rcx
-            pop  rdx
-            pop  rsi
-            pop  rdi
-            pop  rbp
-            pop  r8
-            pop  r9
-            pop  r10
-            pop  r11
-            pop  r12
-            pop  r13
-            pop  r14
-            pop  r15
-            popfq
-            add  rsp, 136
-        """
-    else:  # win64
-        PBODY = """\
-            pushfq
-            push r15
-            push r14
-            push r13
-            push r12
-            push r11
-            push r10
-            push r9
-            push r8
-            push rbp
-            push rdi
-            push rsi
-            push rdx
-            push rcx
-            push rbx
-            push rax
-            mov  rcx, rsp
-            sub  rsp, 40
-        """
-        RBODY = """\
-            add  rsp, 40
-            pop  rax
-            pop  rbx
-            pop  rcx
-            pop  rdx
-            pop  rsi
-            pop  rdi
-            pop  rbp
-            pop  r8
-            pop  r9
-            pop  r10
-            pop  r11
-            pop  r12
-            pop  r13
-            pop  r14
-            pop  r15
-            popfq
-        """
 
-    body, _    = ks.asm(PBODY, addr=inject_va)
-    body_sz    = len(body)
-    prologue_sz= body_sz + 5   # + call rel32
-
-    epi_va    = inject_va + prologue_sz
-    restore, _= ks.asm(RBODY, addr=epi_va)
-    restore    = bytes(restore)
-
-    stolen_va = epi_va + len(restore)
-    fixed     = fixup_insns(stolen_insns, stolen_va)
-
-    jmp_site  = stolen_va + len(fixed)
-    jrel      = return_va - (jmp_site + 5)
-    if not (-(1<<31) <= jrel <= (1<<31)-1):
-        print("[!] Return JMP overflow"); sys.exit(1)
-    jmp_back  = bytes([0xE9]) + struct.pack("<i", jrel)
-    epilogue  = restore + fixed + jmp_back
-
-    payload_va = inject_va + prologue_sz + len(epilogue)
-    crel       = payload_va - (inject_va + prologue_sz)
-    prologue   = bytes(body) + bytes([0xE8]) + struct.pack("<i", crel)
-    assert len(prologue) == prologue_sz
-
-    return prologue, epilogue, prologue + epilogue + payload_bytes
+# ==============================================================================
+#  ARCHITECTURE BACKENDS
+# ==============================================================================
+# Instruction stealing, relocation fixups, trampoline/prologue generation,
+# and hook patch encoding are implemented in:
+#   bpatch_arch/x86_64.py
+#   bpatch_arch/aarch64.py
 
 
 # ==============================================================================
@@ -678,25 +1096,44 @@ def _align_up(v: int, a: int) -> int:
     return (v + a - 1) & ~(a - 1)
 
 
-def _write_jmp(binary, target_va: int, inject_va: int, stolen_sz: int):
-    rel = inject_va - (target_va + 5)
-    if -(1<<31) <= rel <= (1<<31)-1:
-        patch = bytes([0xE9]) + struct.pack("<i", rel); nops = stolen_sz - 5
-    else:
-        if stolen_sz < 14:
-            print(f"[!] Need 14 stolen bytes for far JMP, got {stolen_sz}"); sys.exit(1)
-        patch = b"\xFF\x25\x00\x00\x00\x00" + struct.pack("<Q", inject_va)
-        nops  = stolen_sz - 14
-    full = patch + b"\x90" * nops
+def _get_backend(arch: str):
+    if arch == "x86_64":
+        return backend_x86_64
+    if arch == "aarch64":
+        return backend_aarch64
+    print(f"[!] Unsupported architecture: {arch}")
+    sys.exit(1)
+
+
+def _write_hook(binary, target_va: int, inject_va: int, stolen_sz: int, arch: str):
+    backend = _get_backend(arch)
+    full, patch_len, nops = backend.make_entry_patch(target_va, inject_va, stolen_sz)
     print(f"[*] patching 0x{target_va:x}  JMP -> 0x{inject_va:x}  "
-          f"({len(patch)}B patch + {nops} NOP{'s' if nops!=1 else ''})")
+          f"({patch_len}B patch + {nops} NOP{'s' if nops!=1 else ''})")
     for i, bv in enumerate(full):
         binary.patch_address(target_va + i, bv)
 
 
-def _print_layout(tgt_va, inj_va, prologue, epilogue, payload, ret_va):
+def _next_inj_name(existing: set[str], base: str = ".inj") -> str:
+    """Pick a unique injection section name."""
+    if base not in existing:
+        return base
+    for i in range(1, 0x1000):
+        cand = f".i{i:03x}"   # <= 8 chars, PE-friendly
+        if cand not in existing:
+            return cand
+    print("[!] Could not allocate a unique injection section name")
+    sys.exit(1)
+
+
+def _is_uncond_branch(ins) -> bool:
+    m = getattr(ins, "mnemonic", "").lower()
+    return m in ("jmp", "b", "br")
+
+
+def _print_layout(tgt_va, inj_va, prologue, epilogue, payload, ret_va, inj_label: str = ".inj"):
     print(f"\n[+] Injection layout:")
-    print(f"    0x{tgt_va:016x}  JMP -> .inj  (patch site)")
+    print(f"    0x{tgt_va:016x}  JMP -> {inj_label}  (patch site)")
     print(f"    0x{inj_va:016x}  prologue  ({len(prologue)} bytes)")
     e = inj_va + len(prologue)
     print(f"    0x{e:016x}  epilogue  ({len(epilogue)} bytes)  <- ret lands here")
@@ -709,9 +1146,13 @@ def _print_layout(tgt_va, inj_va, prologue, epilogue, payload, ret_va):
 #  INJECTION - ELF
 # ==============================================================================
 
-def inject_elf(binary_path: Path, target_va: int, payload_c: Path, out: Path):
+def inject_elf(binary_path: Path, target_va: int, payload_c: Path, out: Path, arch: str,
+               cc_override: str = "", ld_override: str = "", objcopy_override: str = "",
+               payload_opt: str = "O2"):
     binary = lief.parse(str(binary_path))
     raw    = binary_path.read_bytes()
+    existing_names = {s.name for s in binary.sections}
+    inj_name = _next_inj_name(existing_names, ".inj")
 
     tgt_seg = next((s for s in binary.segments
                     if s.virtual_address <= target_va < s.virtual_address + s.virtual_size),
@@ -722,12 +1163,19 @@ def inject_elf(binary_path: Path, target_va: int, payload_c: Path, out: Path):
           f"foff=0x{tgt_seg.file_offset:x}")
 
     with tempfile.TemporaryDirectory() as tmp:
-        payload_bytes = compile_payload(payload_c, Path(tmp), pe=False)
+        payload_bytes, payload_off = compile_payload(
+            payload_c, Path(tmp), pe=False, arch=arch,
+            cc_override=cc_override, ld_override=ld_override,
+            objcopy_override=objcopy_override, payload_opt=payload_opt)
     print()
 
     print("[*] Analyzing injection point...")
-    stolen, stolen_sz = steal_insns(raw, target_va,
-                                    tgt_seg.virtual_address, tgt_seg.file_offset)
+    backend = _get_backend(arch)
+    stolen, stolen_sz = backend.steal_insns(raw, target_va,
+                                            tgt_seg.virtual_address, tgt_seg.file_offset)
+    if stolen and _is_uncond_branch(stolen[0]):
+        print("[*] Note: target begins with an unconditional branch; "
+              "re-patching will chain through previous hook code.")
     return_va = target_va + stolen_sz
     print()
 
@@ -735,33 +1183,33 @@ def inject_elf(binary_path: Path, target_va: int, payload_c: Path, out: Path):
     est_va = _align_up(max_va, 0x1000)
     print(f"[+] estimated .inj vaddr: 0x{est_va:x}")
 
-    prologue, epilogue, content = build_section_content(
-        est_va, payload_bytes, stolen, return_va, abi="sysv")
+    prologue, epilogue, content = backend.build_section_content(
+        est_va, payload_bytes, payload_off, stolen, return_va, abi="sysv")
 
-    sec         = lief.ELF.Section(".inj")
+    sec         = lief.ELF.Section(inj_name)
     sec.type    = lief.ELF.Section.TYPE.PROGBITS
     sec.flags   = lief.ELF.Section.FLAGS.ALLOC | lief.ELF.Section.FLAGS.EXECINSTR
     sec.content = list(content)
     sec.alignment = 0x10
     binary.add(sec, loaded=True)
 
-    real_va = next((s.virtual_address for s in binary.sections if s.name == ".inj"), None)
+    real_va = next((s.virtual_address for s in binary.sections if s.name == inj_name), None)
     if real_va is None:
-        print("[!] .inj not found after add"); sys.exit(1)
-    print(f"[+] LIEF placed .inj at: 0x{real_va:x}")
+        print(f"[!] {inj_name} not found after add"); sys.exit(1)
+    print(f"[+] LIEF placed {inj_name} at: 0x{real_va:x}")
 
     if real_va != est_va:
         print(f"[*] Regenerating for actual vaddr 0x{real_va:x}...")
-        prologue, epilogue, content = build_section_content(
-            real_va, payload_bytes, stolen, return_va, abi="sysv")
+        prologue, epilogue, content = backend.build_section_content(
+            real_va, payload_bytes, payload_off, stolen, return_va, abi="sysv")
         for s in binary.sections:
-            if s.name == ".inj": s.content = list(content); break
+            if s.name == inj_name: s.content = list(content); break
 
-    _write_jmp(binary, target_va, real_va, stolen_sz)
+    _write_hook(binary, target_va, real_va, stolen_sz, arch)
     binary.write(str(out))
     if platform.system() != "Windows":
         os.chmod(str(out), os.stat(str(out)).st_mode | 0o111)
-    _print_layout(target_va, real_va, prologue, epilogue, payload_bytes, return_va)
+    _print_layout(target_va, real_va, prologue, epilogue, payload_bytes, return_va, inj_name)
 
 
 # ==============================================================================
@@ -833,6 +1281,7 @@ def _pe_sections(raw: bytearray, h: dict) -> list:
         base = h["sectbl"] + i * _SEC_HDR_SIZE
         name = raw[base:base+8].rstrip(b"\x00").decode("ascii", errors="replace")
         secs.append({
+            "base":   base,  # file offset of this IMAGE_SECTION_HEADER
             "name":   name,
             "vsize":  struct.unpack_from("<I", raw, base + _SEC_VSIZE)[0],
             "va":     struct.unpack_from("<I", raw, base + _SEC_VA)[0],
@@ -843,7 +1292,13 @@ def _pe_sections(raw: bytearray, h: dict) -> list:
     return secs
 
 
-def inject_pe(binary_path: Path, target_va: int, payload_c: Path, out: Path):
+def inject_pe(binary_path: Path, target_va: int, payload_c: Path, out: Path, arch: str,
+              cc_override: str = "", ld_override: str = "", objcopy_override: str = "",
+              payload_opt: str = "O2"):
+    if arch != "x86_64":
+        print(f"[!] PE {arch} is not supported yet. Only PE x86_64 is supported.")
+        sys.exit(1)
+
     # Use LIEF only for imagebase and section_alignment (convenience)
     parsed     = lief.parse(str(binary_path))
     raw        = bytearray(binary_path.read_bytes())
@@ -854,6 +1309,8 @@ def inject_pe(binary_path: Path, target_va: int, payload_c: Path, out: Path):
 
     h    = _pe_hdr(raw)
     secs = _pe_sections(raw, h)
+    existing_names = {s["name"] for s in secs}
+    inj_name = _next_inj_name(existing_names, ".inj")
 
     tgt = next((s for s in secs
                 if s["va"] <= rva < s["va"] + max(s["vsize"], s["rawsz"])), None)
@@ -866,38 +1323,62 @@ def inject_pe(binary_path: Path, target_va: int, payload_c: Path, out: Path):
     sec_foff = tgt["rawptr"]
     print(f"[+] target section: {tgt['name']!r}  va=0x{sec_va:x}  foff=0x{sec_foff:x}")
 
-    # Check there is room in the header for one more section entry
+    # Check whether we can add a brand-new section header.
+    # Some protected binaries pack the section table tightly (no spare 40 bytes).
     new_hdr_off = h["sectbl"] + h["nsec"] * _SEC_HDR_SIZE
-    if new_hdr_off + _SEC_HDR_SIZE > h["soh"]:
+    can_add_section = (new_hdr_off + _SEC_HDR_SIZE <= h["soh"])
+    if not can_add_section:
         print(f"[!] No room in PE header for a new section entry.")
         print(f"    Header space ends at 0x{h['soh']:x}, "
               f"need 0x{new_hdr_off + _SEC_HDR_SIZE:x}")
-        sys.exit(1)
+        print(f"[*] Falling back to extending an existing tail section.")
 
     # Compile payload
     with tempfile.TemporaryDirectory() as tmp:
-        payload_bytes = compile_payload(payload_c, Path(tmp), pe=True)
+        payload_bytes, payload_off = compile_payload(
+            payload_c, Path(tmp), pe=True, arch=arch,
+            cc_override=cc_override, ld_override=ld_override,
+            objcopy_override=objcopy_override, payload_opt=payload_opt)
     print()
 
     # Steal instructions from target
     print("[*] Analyzing injection point...")
-    stolen, stolen_sz = steal_insns(bytes(raw), target_va, sec_va, sec_foff)
+    backend = _get_backend(arch)
+    stolen, stolen_sz = backend.steal_insns(bytes(raw), target_va, sec_va, sec_foff)
+    if stolen and _is_uncond_branch(stolen[0]):
+        print("[*] Note: target begins with an unconditional branch; "
+              "re-patching will chain through previous hook code.")
     return_va = target_va + stolen_sz
     print()
 
-    # Calculate new section placement
-    # VirtualAddress: section-aligned past last section's virtual extent
-    last_end = max(s["va"] + max(s["vsize"], s["rawsz"]) for s in secs)
-    inj_rva  = _align_up(last_end, sec_align)
-    inj_va   = imagebase + inj_rva
-    # PointerToRawData: file-aligned at end of current file
-    inj_rawptr = _align_up(len(raw), h["fa"])
-    print(f"[+] .inj vaddr:   0x{inj_va:x}  (RVA 0x{inj_rva:x})")
-    print(f"[+] .inj foffset: 0x{inj_rawptr:x}")
+    # Decide placement:
+    #  1) preferred: create a dedicated .inj section
+    #  2) fallback: append bytes and extend the last section header in-place
+    host_sec = None
+    if can_add_section:
+        last_end = max(s["va"] + max(s["vsize"], s["rawsz"]) for s in secs)
+        inj_rva  = _align_up(last_end, sec_align)
+        inj_rawptr = _align_up(len(raw), h["fa"])
+        inj_va   = imagebase + inj_rva
+        print(f"[+] {inj_name} vaddr:   0x{inj_va:x}  (RVA 0x{inj_rva:x})")
+        print(f"[+] {inj_name} foffset: 0x{inj_rawptr:x}")
+    else:
+        # Pick the section with the highest mapped VA extent (typically last: .reloc)
+        host_sec = max(secs, key=lambda s: s["va"] + max(s["vsize"], s["rawsz"]))
+        inj_rawptr = _align_up(len(raw), h["fa"])
+        inj_off_in_host = inj_rawptr - host_sec["rawptr"]
+        if inj_off_in_host < 0:
+            print(f"[!] Internal error: negative host offset for fallback inject")
+            sys.exit(1)
+        inj_rva = host_sec["va"] + inj_off_in_host
+        inj_va  = imagebase + inj_rva
+        print(f"[+] fallback host section: {host_sec['name']!r}")
+        print(f"[+] {inj_name} vaddr:          0x{inj_va:x}  (RVA 0x{inj_rva:x})")
+        print(f"[+] {inj_name} foffset:        0x{inj_rawptr:x}")
 
     # Build section content at the known vaddr (no second pass needed)
-    prologue, epilogue, content = build_section_content(
-        inj_va, payload_bytes, stolen, return_va, abi="win64")
+    prologue, epilogue, content = backend.build_section_content(
+        inj_va, payload_bytes, payload_off, stolen, return_va, abi="win64")
 
     # Pad content to FileAlignment
     inj_rawsz      = _align_up(len(content), h["fa"])
@@ -905,54 +1386,84 @@ def inject_pe(binary_path: Path, target_va: int, payload_c: Path, out: Path):
 
     # Patch JMP directly into raw bytes at the correct file offset
     patch_foff = sec_foff + (rva - tgt["va"])
-    jmp_rel    = inj_va - (target_va + 5)
-    if -(1<<31) <= jmp_rel <= (1<<31)-1:
-        patch = bytes([0xE9]) + struct.pack("<i", jmp_rel)
-        nops  = stolen_sz - 5
-    else:
-        if stolen_sz < 14:
-            print(f"[!] Need 14 stolen bytes for far JMP, got {stolen_sz}")
-            sys.exit(1)
-        patch = b"\xFF\x25\x00\x00\x00\x00" + struct.pack("<Q", inj_va)
-        nops  = stolen_sz - 14
-    full_patch = patch + b"\x90" * nops
+
+    # Safety: the patch address must have backing raw data on disk.
+    # If vsize > rawsz, the tail of the virtual section is zero-filled
+    # by the loader but doesn't exist in the file -- patching there would
+    # write past end of file or into the wrong location.
+    patch_rva_offset = rva - tgt["va"]
+    if patch_rva_offset >= tgt["rawsz"]:
+        print(f"[!] Target RVA 0x{rva:x} is in the virtual-only tail of section "
+              f"{tgt['name']!r} (rawsz=0x{tgt['rawsz']:x}, vsize=0x{tgt['vsize']:x}).")
+        print(f"    This address has no backing bytes on disk and cannot be patched.")
+        sys.exit(1)
+    full_patch, patch_len, nops = backend.make_entry_patch(target_va, inj_va, stolen_sz)
     raw[patch_foff : patch_foff + len(full_patch)] = full_patch
     print(f"[*] patching 0x{target_va:x}  JMP -> 0x{inj_va:x}  "
-          f"({len(patch)}B patch + {nops} NOP{'s' if nops!=1 else ''})")
+          f"({patch_len}B patch + {nops} NOP{'s' if nops!=1 else ''})")
 
-    # Write new section header into the header space
-    # IMAGE_SCN_CNT_CODE(0x20) | IMAGE_SCN_MEM_EXECUTE(0x20000000) | IMAGE_SCN_MEM_READ(0x40000000)
-    SEC_CHARS  = 0x60000020
-    name_bytes = b".inj\x00\x00\x00\x00"
-    new_hdr    = (
-        name_bytes +
-        struct.pack("<I", len(content)) +  # VirtualSize
-        struct.pack("<I", inj_rva)      +  # VirtualAddress
-        struct.pack("<I", inj_rawsz)    +  # SizeOfRawData
-        struct.pack("<I", inj_rawptr)   +  # PointerToRawData
-        struct.pack("<I", 0)            +  # PointerToRelocations
-        struct.pack("<I", 0)            +  # PointerToLinenumbers
-        struct.pack("<H", 0)            +  # NumberOfRelocations
-        struct.pack("<H", 0)            +  # NumberOfLinenumbers
-        struct.pack("<I", SEC_CHARS)       # Characteristics
-    )
-    assert len(new_hdr) == _SEC_HDR_SIZE, f"section header size mismatch: {len(new_hdr)}"
-    raw[new_hdr_off : new_hdr_off + _SEC_HDR_SIZE] = new_hdr
+    # Make injected bytes executable+readable code
+    SEC_CHARS = 0x60000020  # CODE|EXECUTE|READ
 
-    # Update NumberOfSections
-    struct.pack_into("<H", raw, h["nsec_off"], h["nsec"] + 1)
+    if can_add_section:
+        # Write new section header into free table space
+        name_bytes = inj_name.encode("ascii", errors="strict").ljust(8, b"\x00")
+        new_hdr    = (
+            name_bytes +
+            struct.pack("<I", len(content)) +  # VirtualSize
+            struct.pack("<I", inj_rva)      +  # VirtualAddress
+            struct.pack("<I", inj_rawsz)    +  # SizeOfRawData
+            struct.pack("<I", inj_rawptr)   +  # PointerToRawData
+            struct.pack("<I", 0)            +  # PointerToRelocations
+            struct.pack("<I", 0)            +  # PointerToLinenumbers
+            struct.pack("<H", 0)            +  # NumberOfRelocations
+            struct.pack("<H", 0)            +  # NumberOfLinenumbers
+            struct.pack("<I", SEC_CHARS)       # Characteristics
+        )
+        assert len(new_hdr) == _SEC_HDR_SIZE, f"section header size mismatch: {len(new_hdr)}"
+        raw[new_hdr_off : new_hdr_off + _SEC_HDR_SIZE] = new_hdr
 
-    # Update SizeOfImage
-    new_soi = _align_up(inj_rva + inj_rawsz, sec_align)
+        # Update NumberOfSections
+        struct.pack_into("<H", raw, h["nsec_off"], h["nsec"] + 1)
+    else:
+        # Extend host section to include appended injected bytes.
+        # Keep existing data intact; we only increase bounds and exec flags.
+        inj_off_in_host = inj_rawptr - host_sec["rawptr"]
+        new_host_rawsz = max(host_sec["rawsz"], inj_off_in_host + inj_rawsz)
+        new_host_vsize = max(host_sec["vsize"], inj_off_in_host + len(content))
+        new_host_chars = host_sec["chars"] | SEC_CHARS
+
+        struct.pack_into("<I", raw, host_sec["base"] + _SEC_VSIZE, new_host_vsize)
+        struct.pack_into("<I", raw, host_sec["base"] + _SEC_RAWSZ, new_host_rawsz)
+        struct.pack_into("<I", raw, host_sec["base"] + _SEC_CHARS, new_host_chars)
+
+        host_sec["vsize"] = new_host_vsize
+        host_sec["rawsz"] = new_host_rawsz
+        host_sec["chars"] = new_host_chars
+
+        print(f"[*] extended section {host_sec['name']!r}: "
+              f"vsize=0x{new_host_vsize:x}, rawsz=0x{new_host_rawsz:x}, "
+              f"chars=0x{new_host_chars:08x}")
+
+    # Update SizeOfImage (works for both modes)
+    if can_add_section:
+        new_soi = _align_up(inj_rva + inj_rawsz, sec_align)
+    else:
+        new_soi = _align_up(max(s["va"] + max(s["vsize"], s["rawsz"]) for s in secs),
+                            sec_align)
     struct.pack_into("<I", raw, h["soi_off"], new_soi)
 
-    # Append section content (with any alignment gap before it)
+    # Place injected content (with any alignment gap before it)
     if inj_rawptr > len(raw):
         raw += b"\x00" * (inj_rawptr - len(raw))
-    raw += content_padded
+    end = inj_rawptr + len(content_padded)
+    if end > len(raw):
+        raw += b"\x00" * (end - len(raw))
+    raw[inj_rawptr:end] = content_padded
 
     out.write_bytes(bytes(raw))
-    _print_layout(target_va, inj_va, prologue, epilogue, payload_bytes, return_va)
+    layout_label = inj_name if can_add_section else f"{host_sec['name']}(+inj)"
+    _print_layout(target_va, inj_va, prologue, epilogue, payload_bytes, return_va, layout_label)
 
 
 # ==============================================================================
@@ -968,7 +1479,7 @@ def _detect_format(binary_path: Path) -> str:
         sys.exit(1)
     if parsed is None:
         print(f"[!] LIEF could not parse {binary_path}")
-        print(f"    Make sure it is a valid x86-64 ELF or PE binary.")
+        print(f"    Make sure it is a valid ELF or PE binary.")
         sys.exit(1)
     if   isinstance(parsed, lief.ELF.Binary):   return "ELF"
     elif isinstance(parsed, lief.PE.Binary):    return "PE"
@@ -980,18 +1491,62 @@ def _detect_format(binary_path: Path) -> str:
         sys.exit(1)
 
 
-def inject(binary_path: Path, target_va: int, payload_c: Path, out: Path):
+def _detect_arch(binary_path: Path, fmt: str) -> str:
+    parsed = lief.parse(str(binary_path))
+    if parsed is None:
+        print(f"[!] LIEF could not parse {binary_path}")
+        sys.exit(1)
+
+    if fmt == "ELF":
+        mt = str(parsed.header.machine_type).upper()
+        if "X86_64" in mt or "AMD64" in mt:
+            return "x86_64"
+        if "AARCH64" in mt or "ARM64" in mt:
+            return "aarch64"
+        print(f"[!] Unsupported ELF architecture: {parsed.header.machine_type}")
+        print("    Supported ELF arches: x86_64, aarch64")
+        sys.exit(1)
+
+    # PE
+    mt = str(parsed.header.machine).upper()
+    if "AMD64" in mt or "X86_64" in mt:
+        return "x86_64"
+    if "ARM64" in mt or "AARCH64" in mt:
+        return "aarch64"
+    print(f"[!] Unsupported PE architecture: {parsed.header.machine}")
+    print("    Supported PE arch: x86_64")
+    sys.exit(1)
+
+
+def inject(binary_path: Path, target_va: int, payload_c: Path, out: Path,
+           cc_override: str = "", ld_override: str = "", objcopy_override: str = "",
+           payload_opt: str = "O2"):
     fmt = _detect_format(binary_path)
+    arch = _detect_arch(binary_path, fmt)
 
     print(f"[*] binary:  {binary_path}")
     print(f"[*] format:  {fmt}")
+    print(f"[*] arch:    {arch}")
     print(f"[*] target:  0x{target_va:x}")
     print(f"[*] payload: {payload_c}")
     print(f"[*] output:  {out}")
+    if cc_override:
+        print(f"[*] cc:      {cc_override}")
+    if ld_override:
+        print(f"[*] ld:      {ld_override}")
+    if objcopy_override:
+        print(f"[*] objcopy: {objcopy_override}")
+    print(f"[*] payload-opt: -{payload_opt}")
     print()
 
-    if fmt == "ELF": inject_elf(binary_path, target_va, payload_c, out)
-    else:            inject_pe (binary_path, target_va, payload_c, out)
+    if fmt == "ELF":
+        inject_elf(binary_path, target_va, payload_c, out, arch,
+                   cc_override=cc_override, ld_override=ld_override,
+                   objcopy_override=objcopy_override, payload_opt=payload_opt)
+    else:
+        inject_pe(binary_path, target_va, payload_c, out, arch,
+                  cc_override=cc_override, ld_override=ld_override,
+                  objcopy_override=objcopy_override, payload_opt=payload_opt)
 
 
 def _list_examples():
@@ -1007,7 +1562,9 @@ def _list_examples():
     linux = [e for e in examples if not e.stem.endswith("_win")]
     win   = [e for e in examples if e.stem.endswith("_win")]
     if linux:
-        print("  Linux / ELF (SysV ABI: ARG1=rdi, ARG2=rsi ...)")
+        print("  Linux / ELF (x86_64 and aarch64)")
+        print("    x86_64 ARG1=rdi, ARG2=rsi ...")
+        print("    aarch64 ARG1=x0, ARG2=x1 ...")
         for e in linux:
             # Pull the first comment line as description
             lines = e.read_text(encoding="utf-8").splitlines()
@@ -1049,6 +1606,8 @@ examples:
   # Inject at a function entry and dump the first argument (a string)
   bpatch.py target.exe  --at 0x140001234 --payload dump_string_win.c
   bpatch.py target.elf  --at 0x401234    --payload dump_string.c
+  bpatch.py target_arm64.elf --at 0x400123 --payload dump_string.c
+  bpatch.py target_arm64.elf --at 0x400123 --payload dump_string.c --cc aarch64-linux-android34-clang
 
   # Log all register values every time a site is hit
   bpatch.py target.exe  --at 0x140001234 --payload log_regs_win.c
@@ -1056,9 +1615,17 @@ examples:
   # Force a function to always return 1 (bypass license/anti-debug checks)
   bpatch.py target.exe  --at 0x14000ABCD --payload patch_retval_win.c
 
+  # Switch payload compiler and optimization level explicitly
+  bpatch.py target.elf --at 0x401234 --payload dump_string.c --cc clang --payload-opt Oz
+  bpatch.py target.exe --at 0x140001234 --payload dump_string_win.c --cc x86_64-w64-mingw32-gcc
+
+  # Re-patch an already patched binary (chains hooks)
+  bpatch.py stress_patched.exe --at 0x140001450 --payload stress_payload_win.c -o stress_patched2.exe
+
   # Dump the runtime header so you can write your own payload
   bpatch.py --dump-header --pe       (Windows)
-  bpatch.py --dump-header            (Linux)
+  bpatch.py --dump-header --arch x86_64   (Linux x86_64)
+  bpatch.py --dump-header --arch aarch64  (Linux/Android arm64)
 
   # List available example payloads
   bpatch.py --list
@@ -1077,6 +1644,19 @@ examples:
                     help="Write bpatch_rt.h to the current directory and exit")
     ap.add_argument("--pe",           action="store_true",
                     help="Use the Windows/PE runtime header (with --dump-header)")
+    ap.add_argument("--arch",         choices=("x86_64", "aarch64"),
+                    default="x86_64",
+                    help="Architecture for --dump-header (default: x86_64)")
+    ap.add_argument("--cc",           metavar="COMPILER",
+                    help="Payload C compiler override (e.g. clang, gcc, "
+                         "aarch64-linux-android34-clang)")
+    ap.add_argument("--ld",           metavar="LINKER",
+                    help="Payload linker override (optional)")
+    ap.add_argument("--objcopy",      metavar="OBJCOPY",
+                    help="Payload objcopy override (optional)")
+    ap.add_argument("--payload-opt",  choices=("O0", "O1", "O2", "O3", "Os", "Oz"),
+                    default="O2",
+                    help="Payload optimization level (default: O2)")
     ap.add_argument("--list",         action="store_true",
                     help="List available example payloads and exit")
     args = ap.parse_args()
@@ -1087,8 +1667,16 @@ examples:
         return
 
     if args.dump_header:
-        rt, name = (BPATCH_RT_WIN64_H, "bpatch_rt_win64.h") if args.pe \
-                   else (BPATCH_RT_LINUX_H, "bpatch_rt.h")
+        if args.pe:
+            if args.arch != "x86_64":
+                print("[!] --dump-header --pe currently supports only --arch x86_64")
+                sys.exit(1)
+            rt, name = BPATCH_RT_WIN64_H, "bpatch_rt_win64.h"
+        else:
+            if args.arch == "x86_64":
+                rt, name = BPATCH_RT_LINUX_H, "bpatch_rt.h"
+            else:
+                rt, name = BPATCH_RT_AARCH64_LINUX_H, "bpatch_rt_aarch64.h"
         Path(name).write_text(rt, encoding="utf-8")
         print(f"[+] Written: {Path(name).resolve()}")
         print(f"    Include this in your payload with:  #include \"bpatch_rt.h\"")
@@ -1142,7 +1730,11 @@ examples:
         print(f"[!] Output path is the same as input. Use -o to specify a different path.")
         sys.exit(1)
 
-    inject(binary_path, target_va, payload_path, out)
+    inject(binary_path, target_va, payload_path, out,
+           cc_override=(args.cc or ""),
+           ld_override=(args.ld or ""),
+           objcopy_override=(args.objcopy or ""),
+           payload_opt=args.payload_opt)
     print(f"\n[+] Done. Patched binary: {out}")
     print(f"    Original is unchanged:  {binary_path}")
 
