@@ -1,0 +1,30 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts
+*.exe
+*.obj
+*.o
+*.so
+*.dll
+*.a
+
+# Logs / dumps
+*.log
+*.bin
+*.dmp
+
+# Temp and editor
+*.tmp
+*.swp
+.DS_Store
+
+# Local generated headers
+bpatch_rt.h
+bpatch_rt_win64.h
+bpatch_rt_aarch64.h
+
+# Misc local files seen during testing
+steam_appid.txt
