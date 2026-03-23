@@ -673,7 +673,6 @@ SECTIONS {
     . = 0x0;
     .text   : { *(.text .text.*) }
     .rodata : { *(.rodata .rodata.* .rodata.cst* .rdata .rdata.*) }
-    /DISCARD/ : { *(*) }
 }
 """
 
