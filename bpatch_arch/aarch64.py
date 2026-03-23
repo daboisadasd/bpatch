@@ -115,6 +115,23 @@ def _abs_branch_bytes(target_va: int, link: bool = False, reg: str = "x17") -> b
     return b
 
 
+def _rel_branch_bytes(src_va: int, target_va: int, link: bool = False) -> bytes | None:
+    """
+    Try to emit a PC-relative branch/call (b/bl).
+    Returns encoded bytes on success, or None if out of range/failed.
+    """
+    ks = keystone.Ks(keystone.KS_ARCH_ARM64, keystone.KS_MODE_LITTLE_ENDIAN)
+    op = "bl" if link else "b"
+    try:
+        enc, _ = ks.asm(f"{op} 0x{target_va:x}", addr=src_va)
+    except Exception:
+        return None
+    b = bytes(enc)
+    if len(b) != 4:
+        return None
+    return b
+
+
 def build_section_content(inject_va: int, payload_bytes: bytes,
                           payload_off: int, stolen_insns, return_va: int,
                           abi: str = "sysv") -> tuple[bytes, bytes, bytes]:
@@ -180,7 +197,11 @@ def build_section_content(inject_va: int, payload_bytes: bytes,
 
     stolen_va = epi_va + len(restore)
     fixed = fixup_insns(stolen_insns, stolen_va)
-    jump_back = _abs_branch_bytes(return_va, link=False)
+    # Prefer PIE-safe relative branch when in range; fall back to absolute branch.
+    jump_back_src = stolen_va + len(fixed)
+    jump_back = _rel_branch_bytes(jump_back_src, return_va, link=False)
+    if jump_back is None:
+        jump_back = _abs_branch_bytes(return_va, link=False)
     epilogue = restore + fixed + jump_back
 
     payload_blob_va = inject_va + prologue_sz + len(epilogue)
@@ -201,7 +222,10 @@ def build_section_content(inject_va: int, payload_bytes: bytes,
 
 
 def make_entry_patch(target_va: int, inject_va: int, stolen_sz: int) -> tuple[bytes, int, int]:
-    patch = _abs_branch_bytes(inject_va, link=False)
+    # Prefer PIE-safe relative branch when in range; fall back to absolute branch.
+    patch = _rel_branch_bytes(target_va, inject_va, link=False)
+    if patch is None:
+        patch = _abs_branch_bytes(inject_va, link=False)
     patch_len = len(patch)
     if stolen_sz < patch_len:
         print(f"[!] Need {patch_len} stolen bytes for ARM64 hook, got {stolen_sz}")
@@ -213,4 +237,3 @@ def make_entry_patch(target_va: int, inject_va: int, stolen_sz: int) -> tuple[by
     nop_count = extra // 4
     nops = struct.pack("<I", _NOP_WORD) * nop_count
     return patch + nops, patch_len, nop_count
-
