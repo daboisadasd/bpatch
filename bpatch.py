@@ -12,9 +12,12 @@ deps:  pip install lief capstone keystone-engine
 """
 
 import argparse
+import contextlib
+import io
 import os
 import platform
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -784,93 +787,6 @@ def _find_ndk_aarch64_toolchain():
     return None
 
 
-def _auto_toolchain(pe: bool, arch: str) -> tuple[str, str, str]:
-    """Return (gcc, ld, objcopy) for the requested format/arch."""
-    if not pe:
-        if arch == "x86_64":
-            for t in ("gcc", "ld", "objcopy"):
-                if not shutil.which(t):
-                    print(f"[!] {t} not found in PATH")
-                    sys.exit(1)
-            return "gcc", "ld", "objcopy"
-
-        if arch == "aarch64":
-            # Optional explicit overrides:
-            #   BPATCH_AARCH64_CC=/path/to/cc
-            #   BPATCH_AARCH64_LD=/path/to/ld
-            #   BPATCH_AARCH64_OBJCOPY=/path/to/objcopy
-            cc_override = os.environ.get("BPATCH_AARCH64_CC", "").strip()
-            if cc_override:
-                cc = _resolve_exe(cc_override)
-                if not cc:
-                    print(f"[!] BPATCH_AARCH64_CC not found: {cc_override}")
-                    sys.exit(1)
-                ld_ov = os.environ.get("BPATCH_AARCH64_LD", "").strip()
-                oc_ov = os.environ.get("BPATCH_AARCH64_OBJCOPY", "").strip()
-                ld_ = _resolve_exe(ld_ov) if ld_ov else _resolve_near(cc, ("ld", "ld.lld"))
-                oc = _resolve_exe(oc_ov) if oc_ov else _resolve_near(cc, ("objcopy", "llvm-objcopy"))
-                if ld_ and oc:
-                    return cc, ld_, oc
-                print("[!] Could not resolve linker/objcopy for BPATCH_AARCH64_CC.")
-                print("    Set BPATCH_AARCH64_LD and BPATCH_AARCH64_OBJCOPY explicitly.")
-                sys.exit(1)
-
-            # Optional override: e.g. BPATCH_AARCH64_PREFIX=aarch64-linux-gnu-
-            pfx = os.environ.get("BPATCH_AARCH64_PREFIX", "").strip()
-            prefixes = [pfx] if pfx else []
-            prefixes += [
-                "aarch64-linux-gnu-",
-                "aarch64-none-linux-gnu-",
-                "aarch64-unknown-linux-gnu-",
-                "aarch64-linux-android-",
-            ]
-            for prefix in prefixes:
-                gcc = _resolve_exe(prefix + "gcc")
-                ld_ = _resolve_exe(prefix + "ld")
-                oc = _resolve_exe(prefix + "objcopy")
-                if gcc and ld_ and oc:
-                    return gcc, ld_, oc
-
-            ndk_tc = _find_ndk_aarch64_toolchain()
-            if ndk_tc:
-                return ndk_tc
-
-            print("[!] Could not find an AArch64 ELF toolchain.")
-            print("    Looked for prefixes:")
-            print("      aarch64-linux-gnu-")
-            print("      aarch64-none-linux-gnu-")
-            print("      aarch64-unknown-linux-gnu-")
-            print("      aarch64-linux-android-")
-            print("    Looked for Android NDK clang wrappers too:")
-            print("      aarch64-linux-android<api>-clang")
-            print("    You can set one of:")
-            print("      BPATCH_AARCH64_PREFIX")
-            print("      BPATCH_AARCH64_CC / BPATCH_AARCH64_LD / BPATCH_AARCH64_OBJCOPY")
-            sys.exit(1)
-
-        print(f"[!] Unsupported ELF architecture: {arch}")
-        sys.exit(1)
-
-    # PE target (x86-64 only for now)
-    if arch != "x86_64":
-        print(f"[!] PE {arch} is not supported yet. Only PE x86_64 is supported.")
-        sys.exit(1)
-
-    prefix = "" if platform.system() == "Windows" else "x86_64-w64-mingw32-"
-    gcc, ld_, oc = prefix + "gcc", prefix + "ld", prefix + "objcopy"
-    for t in (gcc, ld_, oc):
-        if not shutil.which(t):
-            if platform.system() == "Windows":
-                print(f"[!] {t} not found. Install MinGW-w64 and add to PATH.")
-            else:
-                print(f"[!] {t} not found. Install cross-tools:")
-                print(f"    Debian/Ubuntu:  apt install gcc-mingw-w64-x86-64")
-                print(f"    Fedora:         dnf install mingw64-gcc")
-                print(f"    Arch:           pacman -S mingw-w64-gcc")
-            sys.exit(1)
-    return gcc, ld_, oc
-
-
 def _prefer_by_cc(cc: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """
     Return preferred (ld candidates, objcopy candidates) based on compiler flavor.
@@ -882,15 +798,335 @@ def _prefer_by_cc(cc: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     return ("ld", "ld.lld", "lld"), ("objcopy", "llvm-objcopy")
 
 
+def _ordered_candidates(
+    candidates: list[tuple[str, tuple[str, ...], tuple[str, ...]]],
+    toolchain_hint: str,
+) -> list[tuple[str, tuple[str, ...], tuple[str, ...]]]:
+    if toolchain_hint == "auto":
+        return candidates
+
+    preferred: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
+    other: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
+    for cand in candidates:
+        name = cand[0].lower()
+        is_gcc = ("gcc" in name) or (name == "cc")
+        is_clang = "clang" in name
+        if toolchain_hint == "gcc" and is_gcc:
+            preferred.append(cand)
+        elif toolchain_hint == "clang" and is_clang:
+            preferred.append(cand)
+        else:
+            other.append(cand)
+    return preferred + other
+
+
+def _infer_tool_prefix_from_cc(cc: str) -> str:
+    """
+    Infer tool prefix from compiler basename.
+    Examples:
+      x86_64-w64-mingw32-gcc   -> x86_64-w64-mingw32-
+      aarch64-linux-gnu-clang  -> aarch64-linux-gnu-
+    """
+    base = Path(cc).name
+    base = re.sub(r"\.(exe|cmd|bat)$", "", base, flags=re.IGNORECASE)
+    m = re.match(r"(.+-)(gcc|clang)(-\d+)?$", base, flags=re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+def _infer_cc_target_flags(cc: str, pe: bool, arch: str,
+                           target_override: str = "") -> list[str]:
+    """
+    For plain clang installs, infer a sensible --target so payload ABI matches
+    the destination binary ABI.
+    """
+    if target_override:
+        return [f"--target={target_override}"]
+
+    cc_name = Path(cc).name.lower()
+    if "clang" not in cc_name:
+        return []
+
+    # Cross-wrapper clang already bakes target in the executable name.
+    if re.match(r".+-.+-clang(-\d+)?(\.exe)?$", cc_name):
+        return []
+
+    if pe and arch == "x86_64":
+        return ["--target=x86_64-w64-windows-gnu"]
+    if (not pe) and arch == "aarch64":
+        return ["--target=aarch64-linux-gnu"]
+    return []
+
+
+def _infer_ld_target_flags(ld: str, cc: str, pe: bool, arch: str) -> list[str]:
+    """
+    Infer ld emulation flags only when needed for plain, non-prefixed linkers.
+    """
+    if not pe or arch != "x86_64":
+        return []
+    ld_name = Path(ld).name.lower()
+    cc_prefix = _infer_tool_prefix_from_cc(cc).lower()
+    if "x86_64-w64-mingw32-" in cc_prefix or "mingw" in ld_name:
+        return []
+    if ld_name in ("ld", "ld.lld", "lld", "ld.exe", "ld.lld.exe", "lld.exe"):
+        return ["-m", "i386pep"]
+    return []
+
+
+def _toolchain_from_candidate(
+    cc_candidate: str,
+    ld_candidates: tuple[str, ...],
+    objcopy_candidates: tuple[str, ...],
+    allow_missing_ld: bool = False,
+) -> tuple[str, str, str] | None:
+    cc = _resolve_exe(cc_candidate)
+    if not cc:
+        return None
+    ld_ = _resolve_near(cc, ld_candidates)
+    oc = _resolve_near(cc, objcopy_candidates)
+    if not oc:
+        return None
+    if (not ld_) and (not allow_missing_ld):
+        return None
+    return cc, ld_, oc
+
+
+def _parse_extra_flags(flags_raw: str) -> list[str]:
+    if not flags_raw.strip():
+        return []
+    # Use Windows-aware splitting when on Windows.
+    return shlex.split(flags_raw, posix=(platform.system() != "Windows"))
+
+
+def _env_toolchain_overrides(pe: bool, arch: str) -> tuple[str, str, str]:
+    """
+    Read scoped/global env overrides:
+      BPATCH_<ELF|PE>_<ARCH>_{CC,LD,OBJCOPY}
+      BPATCH_{CC,LD,OBJCOPY}
+    Legacy aarch64 aliases are still honored:
+      BPATCH_AARCH64_{CC,LD,OBJCOPY}
+    """
+    scope = f"{'PE' if pe else 'ELF'}_{arch.upper().replace('-', '_')}"
+    scope_cc = os.environ.get(f"BPATCH_{scope}_CC", "").strip()
+    scope_ld = os.environ.get(f"BPATCH_{scope}_LD", "").strip()
+    scope_oc = os.environ.get(f"BPATCH_{scope}_OBJCOPY", "").strip()
+
+    legacy_cc = legacy_ld = legacy_oc = ""
+    if (not pe) and arch == "aarch64":
+        legacy_cc = os.environ.get("BPATCH_AARCH64_CC", "").strip()
+        legacy_ld = os.environ.get("BPATCH_AARCH64_LD", "").strip()
+        legacy_oc = os.environ.get("BPATCH_AARCH64_OBJCOPY", "").strip()
+
+    global_cc = os.environ.get("BPATCH_CC", "").strip()
+    global_ld = os.environ.get("BPATCH_LD", "").strip()
+    global_oc = os.environ.get("BPATCH_OBJCOPY", "").strip()
+
+    cc = scope_cc or legacy_cc or global_cc
+    ld = scope_ld or legacy_ld or global_ld
+    oc = scope_oc or legacy_oc or global_oc
+    return cc, ld, oc
+
+
+def _auto_toolchain(pe: bool, arch: str, toolchain_hint: str = "auto") -> tuple[str, str, str]:
+    """Return (cc, ld, objcopy) for the requested format/arch."""
+    if not pe:
+        if arch == "x86_64":
+            # Prefer GCC on Linux, but support clang-only hosts too.
+            candidates = [
+                ("gcc",
+                 ("ld", "ld.bfd", "ld.gold", "ld.lld", "lld"),
+                 ("objcopy", "llvm-objcopy")),
+                ("gcc-14",
+                 ("ld", "ld.bfd", "ld.gold", "ld.lld", "lld"),
+                 ("objcopy", "llvm-objcopy")),
+                ("gcc-13",
+                 ("ld", "ld.bfd", "ld.gold", "ld.lld", "lld"),
+                 ("objcopy", "llvm-objcopy")),
+                ("gcc-12",
+                 ("ld", "ld.bfd", "ld.gold", "ld.lld", "lld"),
+                 ("objcopy", "llvm-objcopy")),
+                ("x86_64-linux-gnu-gcc",
+                 ("x86_64-linux-gnu-ld", "ld", "ld.bfd"),
+                 ("x86_64-linux-gnu-objcopy", "objcopy", "llvm-objcopy")),
+                ("x86_64-unknown-linux-gnu-gcc",
+                 ("x86_64-unknown-linux-gnu-ld", "ld", "ld.bfd"),
+                 ("x86_64-unknown-linux-gnu-objcopy", "objcopy", "llvm-objcopy")),
+                ("x86_64-pc-linux-gnu-gcc",
+                 ("x86_64-pc-linux-gnu-ld", "ld", "ld.bfd"),
+                 ("x86_64-pc-linux-gnu-objcopy", "objcopy", "llvm-objcopy")),
+                ("clang",
+                 ("ld.lld", "lld", "ld", "ld.bfd"),
+                 ("llvm-objcopy", "objcopy")),
+                ("clang-19",
+                 ("ld.lld", "lld", "ld", "ld.bfd"),
+                 ("llvm-objcopy", "objcopy")),
+                ("clang-18",
+                 ("ld.lld", "lld", "ld", "ld.bfd"),
+                 ("llvm-objcopy", "objcopy")),
+                ("clang-17",
+                 ("ld.lld", "lld", "ld", "ld.bfd"),
+                 ("llvm-objcopy", "objcopy")),
+                ("clang-16",
+                 ("ld.lld", "lld", "ld", "ld.bfd"),
+                 ("llvm-objcopy", "objcopy")),
+                ("cc",
+                 ("ld", "ld.bfd", "ld.gold", "ld.lld", "lld"),
+                 ("objcopy", "llvm-objcopy")),
+            ]
+            for cc_cand, ld_cands, oc_cands in _ordered_candidates(candidates, toolchain_hint):
+                tc = _toolchain_from_candidate(cc_cand, ld_cands, oc_cands, allow_missing_ld=True)
+                if tc:
+                    return tc
+            print("[!] Could not find an x86_64 ELF toolchain.")
+            print("    Tried GCC/Clang families (gcc/clang/cc + objcopy).")
+            sys.exit(1)
+
+        if arch == "aarch64":
+            # Optional explicit prefix override: BPATCH_AARCH64_PREFIX=aarch64-linux-gnu-
+            pfx = os.environ.get("BPATCH_AARCH64_PREFIX", "").strip()
+            prefixes = [pfx] if pfx else []
+            prefixes += [
+                "aarch64-linux-gnu-",
+                "aarch64-none-linux-gnu-",
+                "aarch64-unknown-linux-gnu-",
+                "aarch64-unknown-linux-musl-",
+                "aarch64-linux-musl-",
+                "aarch64-linux-android-",
+            ]
+            cc_order = ("clang", "gcc") if toolchain_hint == "clang" else ("gcc", "clang")
+            for prefix in prefixes:
+                for cc_name in cc_order:
+                    cc = _resolve_exe(prefix + cc_name)
+                    if not cc:
+                        continue
+                    ld_names, oc_names = _prefer_by_cc(cc)
+                    ld_ = _resolve_near(cc, (prefix + "ld",) + ld_names)
+                    oc = _resolve_near(cc, (prefix + "objcopy",) + oc_names)
+                    if ld_ and oc:
+                        return cc, ld_, oc
+
+            ndk_tc = _find_ndk_aarch64_toolchain()
+            if ndk_tc:
+                return ndk_tc
+
+            # Last resort: plain clang + lld/llvm-objcopy (with inferred --target).
+            tc = _toolchain_from_candidate(
+                "clang",
+                ("ld.lld", "lld", "ld"),
+                ("llvm-objcopy", "objcopy"),
+                allow_missing_ld=True,
+            )
+            if tc:
+                return tc
+
+            print("[!] Could not find an AArch64 ELF toolchain.")
+            print("    Looked for prefixed GCC/Clang:")
+            print("      aarch64-linux-gnu-*")
+            print("      aarch64-none-linux-gnu-*")
+            print("      aarch64-unknown-linux-gnu-*")
+            print("      aarch64-linux-android-*")
+            print("    Looked for Android NDK clang wrappers too:")
+            print("      aarch64-linux-android<api>-clang")
+            print("    You can set one of:")
+            print("      BPATCH_AARCH64_PREFIX")
+            print("      BPATCH_AARCH64_CC / BPATCH_AARCH64_LD / BPATCH_AARCH64_OBJCOPY")
+            print("      BPATCH_ELF_AARCH64_CC / BPATCH_ELF_AARCH64_LD / BPATCH_ELF_AARCH64_OBJCOPY")
+            sys.exit(1)
+
+        print(f"[!] Unsupported ELF architecture: {arch}")
+        sys.exit(1)
+
+    # PE target (x86-64 only for now)
+    if arch != "x86_64":
+        print(f"[!] PE {arch} is not supported yet. Only PE x86_64 is supported.")
+        sys.exit(1)
+
+    if platform.system() == "Windows":
+        candidates = [
+            ("x86_64-w64-mingw32-gcc",
+             ("x86_64-w64-mingw32-ld", "ld", "ld.bfd", "ld.lld", "lld"),
+             ("x86_64-w64-mingw32-objcopy", "objcopy", "llvm-objcopy")),
+            ("x86_64-unknown-w64-mingw32-gcc",
+             ("x86_64-unknown-w64-mingw32-ld", "ld", "ld.bfd", "ld.lld", "lld"),
+             ("x86_64-unknown-w64-mingw32-objcopy", "objcopy", "llvm-objcopy")),
+            ("gcc-14",
+             ("ld", "ld.bfd", "ld.lld", "lld"),
+             ("objcopy", "llvm-objcopy")),
+            ("gcc-13",
+             ("ld", "ld.bfd", "ld.lld", "lld"),
+             ("objcopy", "llvm-objcopy")),
+            ("gcc",
+             ("ld", "ld.bfd", "ld.lld", "lld"),
+             ("objcopy", "llvm-objcopy")),
+            ("clang-19",
+             ("ld.lld", "lld", "ld", "ld.bfd"),
+             ("llvm-objcopy", "objcopy")),
+            ("clang-18",
+             ("ld.lld", "lld", "ld", "ld.bfd"),
+             ("llvm-objcopy", "objcopy")),
+            ("clang",
+             ("ld.lld", "lld", "ld", "ld.bfd"),
+             ("llvm-objcopy", "objcopy")),
+        ]
+    else:
+        candidates = [
+            ("x86_64-w64-mingw32-gcc",
+             ("x86_64-w64-mingw32-ld", "ld", "ld.bfd", "ld.lld", "lld"),
+             ("x86_64-w64-mingw32-objcopy", "objcopy", "llvm-objcopy")),
+            ("x86_64-unknown-w64-mingw32-gcc",
+             ("x86_64-unknown-w64-mingw32-ld", "ld", "ld.bfd", "ld.lld", "lld"),
+             ("x86_64-unknown-w64-mingw32-objcopy", "objcopy", "llvm-objcopy")),
+            ("x86_64-w64-mingw32-clang",
+             ("x86_64-w64-mingw32-ld", "ld.lld", "lld", "ld"),
+             ("x86_64-w64-mingw32-objcopy", "llvm-objcopy", "objcopy")),
+            ("x86_64-unknown-w64-mingw32-clang",
+             ("x86_64-unknown-w64-mingw32-ld", "ld.lld", "lld", "ld"),
+             ("x86_64-unknown-w64-mingw32-objcopy", "llvm-objcopy", "objcopy")),
+            ("clang-19",
+             ("ld.lld", "lld", "x86_64-w64-mingw32-ld", "ld"),
+             ("llvm-objcopy", "x86_64-w64-mingw32-objcopy", "objcopy")),
+            ("clang-18",
+             ("ld.lld", "lld", "x86_64-w64-mingw32-ld", "ld"),
+             ("llvm-objcopy", "x86_64-w64-mingw32-objcopy", "objcopy")),
+            ("clang",
+             ("ld.lld", "lld", "x86_64-w64-mingw32-ld", "ld"),
+             ("llvm-objcopy", "x86_64-w64-mingw32-objcopy", "objcopy")),
+        ]
+
+    for cc_cand, ld_cands, oc_cands in _ordered_candidates(candidates, toolchain_hint):
+        tc = _toolchain_from_candidate(cc_cand, ld_cands, oc_cands, allow_missing_ld=True)
+        if tc:
+            return tc
+
+    print("[!] Could not find a PE x86_64 payload toolchain.")
+    if platform.system() == "Windows":
+        print("    Install MinGW-w64 or LLVM (clang + ld.lld + llvm-objcopy), and add to PATH.")
+    else:
+        print("    Install cross-tools or clang/lld:")
+        print("      Debian/Ubuntu: apt install gcc-mingw-w64-x86-64 clang lld llvm")
+        print("      Fedora:        dnf install mingw64-gcc clang lld llvm")
+        print("      Arch:          pacman -S mingw-w64-gcc clang lld llvm")
+    sys.exit(1)
+
+
 def _find_toolchain(pe: bool, arch: str,
                     cc_override: str = "",
                     ld_override: str = "",
-                    objcopy_override: str = "") -> tuple[str, str, str]:
+                    objcopy_override: str = "",
+                    toolchain_hint: str = "auto") -> tuple[str, str, str]:
     """
     Resolve payload toolchain.
     Overrides allow easy switching between gcc/clang or custom wrappers:
       --cc / --ld / --objcopy
+      --toolchain gcc|clang
     """
+    env_cc, env_ld, env_oc = _env_toolchain_overrides(pe, arch)
+    if not cc_override:
+        cc_override = env_cc
+    if not ld_override:
+        ld_override = env_ld
+    if not objcopy_override:
+        objcopy_override = env_oc
+
     cc = ""
     if cc_override:
         cc = _resolve_exe(cc_override)
@@ -920,7 +1156,7 @@ def _find_toolchain(pe: bool, arch: str,
 
     # Fill any unresolved pieces from the default toolchain discovery.
     if not cc or not ld or not oc:
-        auto_cc, auto_ld, auto_oc = _auto_toolchain(pe, arch)
+        auto_cc, auto_ld, auto_oc = _auto_toolchain(pe, arch, toolchain_hint=toolchain_hint)
         if not cc:
             cc = auto_cc
         if not ld:
@@ -936,9 +1172,9 @@ def _find_toolchain(pe: bool, arch: str,
             else:
                 oc = auto_oc
 
-    if not ld or not oc:
-        print("[!] Failed to resolve payload linker/objcopy.")
-        print("    Provide explicit values with --ld and --objcopy.")
+    if not oc:
+        print("[!] Failed to resolve payload objcopy.")
+        print("    Provide explicit values with --objcopy.")
         sys.exit(1)
 
     return cc, ld, oc
@@ -949,7 +1185,11 @@ def compile_payload(c_file: Path, tmpdir: Path, pe: bool = False,
                     cc_override: str = "",
                     ld_override: str = "",
                     objcopy_override: str = "",
-                    payload_opt: str = "O2") -> tuple[bytes, int]:
+                    payload_opt: str = "O2",
+                    payload_cflags: list[str] | None = None,
+                    payload_ldflags: list[str] | None = None,
+                    toolchain_hint: str = "auto",
+                    target_override: str = "") -> tuple[bytes, int]:
     """
     Compile user C payload -> self-contained flat binary blob.
 
@@ -984,8 +1224,27 @@ def compile_payload(c_file: Path, tmpdir: Path, pe: bool = False,
     obj    = tmpdir / "payload.o"
     linked = tmpdir / "payload_linked"
     binf   = tmpdir / "payload.bin"
-    cc, ld_, oc = _find_toolchain(pe, arch, cc_override, ld_override, objcopy_override)
-    print(f"[*] payload toolchain: cc={cc}  ld={ld_}  objcopy={oc}  opt=-{payload_opt}")
+    cc, ld_, oc = _find_toolchain(pe, arch, cc_override, ld_override, objcopy_override,
+                                  toolchain_hint=toolchain_hint)
+    cc_target_flags = _infer_cc_target_flags(cc, pe, arch, target_override=target_override)
+    ld_target_flags = _infer_ld_target_flags(ld_, cc, pe, arch)
+    env_cflags = _parse_extra_flags(os.environ.get("BPATCH_PAYLOAD_CFLAGS", ""))
+    env_ldflags = _parse_extra_flags(os.environ.get("BPATCH_PAYLOAD_LDFLAGS", ""))
+    extra_cflags = env_cflags + list(payload_cflags or [])
+    extra_ldflags = env_ldflags + list(payload_ldflags or [])
+
+    link_mode = "ld" if ld_ else "cc-driver"
+    ld_disp = ld_ if ld_ else "(compiler driver)"
+    print(f"[*] payload toolchain: cc={cc}  ld={ld_disp}  objcopy={oc}  "
+          f"link-mode={link_mode}  opt=-{payload_opt}")
+    if cc_target_flags:
+        print(f"[*] inferred cc target flags: {' '.join(cc_target_flags)}")
+    if ld_target_flags:
+        print(f"[*] inferred ld target flags: {' '.join(ld_target_flags)}")
+    if extra_cflags:
+        print(f"[*] extra payload cflags: {' '.join(extra_cflags)}")
+    if extra_ldflags:
+        print(f"[*] extra payload ldflags: {' '.join(extra_ldflags)}")
 
     opt_flag = "-" + payload_opt
     flags = [opt_flag, "-fPIC", "-ffreestanding", "-fno-builtin",
@@ -996,18 +1255,18 @@ def compile_payload(c_file: Path, tmpdir: Path, pe: bool = False,
         if not pe:
             flags.append("-mno-red-zone")   # Linux SysV only
 
-    r = subprocess.run(
-        [cc] + flags + ["-I", str(tmpdir), "-c", str(tmpdir/"payload.c"), "-o", str(obj)],
-        capture_output=True, text=True)
+    cc_cmd = ([cc] + cc_target_flags + flags + extra_cflags +
+              ["-I", str(tmpdir), "-c", str(tmpdir / "payload.c"), "-o", str(obj)])
+    r = subprocess.run(cc_cmd, capture_output=True, text=True)
     if r.returncode != 0:
         print("[!] Compilation failed:\n" + r.stderr); sys.exit(1)
 
     # Check for undefined symbols (will crash at injection time)
-    cc_name = Path(cc).name
-    tool_prefix = cc_name[:-3] if cc_name.endswith("gcc") else ""
+    tool_prefix = _infer_tool_prefix_from_cc(cc)
     nm_candidates: list[str] = []
     if tool_prefix:
         nm_candidates.append(tool_prefix + "nm")
+        nm_candidates.append(tool_prefix + "llvm-nm")
     nm_candidates += ["llvm-nm", "nm"]
     nm_bin = _resolve_near(cc, tuple(nm_candidates))
     if not nm_bin:
@@ -1024,10 +1283,13 @@ def compile_payload(c_file: Path, tmpdir: Path, pe: bool = False,
     re_candidates: list[str] = []
     if tool_prefix:
         re_candidates.append(tool_prefix + "readelf")
-    re_candidates += ["llvm-readelf", "readelf"]
+        re_candidates.append(tool_prefix + "llvm-readelf")
+        re_candidates.append(tool_prefix + "objdump")
+        re_candidates.append(tool_prefix + "llvm-objdump")
+    re_candidates += ["llvm-readelf", "readelf", "llvm-objdump", "objdump"]
     re_bin = _resolve_near(cc, tuple(re_candidates))
     if not re_bin:
-        print("[!] Could not find readelf/llvm-readelf for relocation check.")
+        print("[!] Could not find readelf/objdump family tool for relocation check.")
         sys.exit(1)
     relf = subprocess.run([re_bin, "-r", str(obj)], capture_output=True, text=True)
     bad = [l.strip() for l in relf.stdout.splitlines() if "PLT32" in l or "GOTPCREL" in l]
@@ -1037,9 +1299,19 @@ def compile_payload(c_file: Path, tmpdir: Path, pe: bool = False,
         sys.exit(1)
 
     # Link with script -> flat binary
-    r = subprocess.run(
-        [ld_, "-T", str(tmpdir/"payload.ld"), "-o", str(linked), str(obj)],
-        capture_output=True, text=True)
+    if ld_:
+        ld_cmd = ([ld_] + ld_target_flags + extra_ldflags +
+                  ["-T", str(tmpdir / "payload.ld"), "-o", str(linked), str(obj)])
+        r = subprocess.run(ld_cmd, capture_output=True, text=True)
+    else:
+        # Fallback: link via compiler driver when standalone ld isn't available.
+        driver_ldflags = [f"-Wl,-T,{tmpdir / 'payload.ld'}"]
+        for f in extra_ldflags:
+            driver_ldflags.append(f if f.startswith("-Wl,") else f"-Wl,{f}")
+        cc_link_cmd = [cc] + cc_target_flags + ["-nostdlib"] + driver_ldflags + [
+            str(obj), "-o", str(linked)
+        ]
+        r = subprocess.run(cc_link_cmd, capture_output=True, text=True)
     if r.returncode != 0:
         print("[!] Link failed:\n" + r.stderr); sys.exit(1)
 
@@ -1147,7 +1419,11 @@ def _print_layout(tgt_va, inj_va, prologue, epilogue, payload, ret_va, inj_label
 
 def inject_elf(binary_path: Path, target_va: int, payload_c: Path, out: Path, arch: str,
                cc_override: str = "", ld_override: str = "", objcopy_override: str = "",
-               payload_opt: str = "O2"):
+               payload_opt: str = "O2",
+               payload_cflags: list[str] | None = None,
+               payload_ldflags: list[str] | None = None,
+               toolchain_hint: str = "auto",
+               target_override: str = ""):
     binary = lief.parse(str(binary_path))
     raw    = binary_path.read_bytes()
     existing_names = {s.name for s in binary.sections}
@@ -1165,7 +1441,9 @@ def inject_elf(binary_path: Path, target_va: int, payload_c: Path, out: Path, ar
         payload_bytes, payload_off = compile_payload(
             payload_c, Path(tmp), pe=False, arch=arch,
             cc_override=cc_override, ld_override=ld_override,
-            objcopy_override=objcopy_override, payload_opt=payload_opt)
+            objcopy_override=objcopy_override, payload_opt=payload_opt,
+            payload_cflags=payload_cflags, payload_ldflags=payload_ldflags,
+            toolchain_hint=toolchain_hint, target_override=target_override)
     print()
 
     print("[*] Analyzing injection point...")
@@ -1293,7 +1571,11 @@ def _pe_sections(raw: bytearray, h: dict) -> list:
 
 def inject_pe(binary_path: Path, target_va: int, payload_c: Path, out: Path, arch: str,
               cc_override: str = "", ld_override: str = "", objcopy_override: str = "",
-              payload_opt: str = "O2"):
+              payload_opt: str = "O2",
+              payload_cflags: list[str] | None = None,
+              payload_ldflags: list[str] | None = None,
+              toolchain_hint: str = "auto",
+              target_override: str = ""):
     if arch != "x86_64":
         print(f"[!] PE {arch} is not supported yet. Only PE x86_64 is supported.")
         sys.exit(1)
@@ -1337,7 +1619,9 @@ def inject_pe(binary_path: Path, target_va: int, payload_c: Path, out: Path, arc
         payload_bytes, payload_off = compile_payload(
             payload_c, Path(tmp), pe=True, arch=arch,
             cc_override=cc_override, ld_override=ld_override,
-            objcopy_override=objcopy_override, payload_opt=payload_opt)
+            objcopy_override=objcopy_override, payload_opt=payload_opt,
+            payload_cflags=payload_cflags, payload_ldflags=payload_ldflags,
+            toolchain_hint=toolchain_hint, target_override=target_override)
     print()
 
     # Steal instructions from target
@@ -1519,7 +1803,11 @@ def _detect_arch(binary_path: Path, fmt: str) -> str:
 
 def inject(binary_path: Path, target_va: int, payload_c: Path, out: Path,
            cc_override: str = "", ld_override: str = "", objcopy_override: str = "",
-           payload_opt: str = "O2"):
+           payload_opt: str = "O2",
+           payload_cflags: list[str] | None = None,
+           payload_ldflags: list[str] | None = None,
+           toolchain_hint: str = "auto",
+           target_override: str = ""):
     fmt = _detect_format(binary_path)
     arch = _detect_arch(binary_path, fmt)
 
@@ -1536,16 +1824,28 @@ def inject(binary_path: Path, target_va: int, payload_c: Path, out: Path,
     if objcopy_override:
         print(f"[*] objcopy: {objcopy_override}")
     print(f"[*] payload-opt: -{payload_opt}")
+    if toolchain_hint != "auto":
+        print(f"[*] toolchain preference: {toolchain_hint}")
+    if target_override:
+        print(f"[*] target override: {target_override}")
+    if payload_cflags:
+        print(f"[*] payload-cflags: {' '.join(payload_cflags)}")
+    if payload_ldflags:
+        print(f"[*] payload-ldflags: {' '.join(payload_ldflags)}")
     print()
 
     if fmt == "ELF":
         inject_elf(binary_path, target_va, payload_c, out, arch,
                    cc_override=cc_override, ld_override=ld_override,
-                   objcopy_override=objcopy_override, payload_opt=payload_opt)
+                   objcopy_override=objcopy_override, payload_opt=payload_opt,
+                   payload_cflags=payload_cflags, payload_ldflags=payload_ldflags,
+                   toolchain_hint=toolchain_hint, target_override=target_override)
     else:
         inject_pe(binary_path, target_va, payload_c, out, arch,
                   cc_override=cc_override, ld_override=ld_override,
-                  objcopy_override=objcopy_override, payload_opt=payload_opt)
+                  objcopy_override=objcopy_override, payload_opt=payload_opt,
+                  payload_cflags=payload_cflags, payload_ldflags=payload_ldflags,
+                  toolchain_hint=toolchain_hint, target_override=target_override)
 
 
 def _list_examples():
@@ -1583,6 +1883,422 @@ def _list_examples():
     print()
 
 
+def _dedupe_keep_order(items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in items:
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _find_nm_tool(pe: bool, arch: str, cc_override: str = "",
+                  toolchain_hint: str = "auto") -> str:
+    candidates: list[str] = []
+
+    if cc_override:
+        cc = _resolve_exe(cc_override)
+        if cc:
+            pfx = _infer_tool_prefix_from_cc(cc)
+            if pfx:
+                candidates += [pfx + "nm", pfx + "llvm-nm"]
+            candidates += ["llvm-nm", "nm"]
+
+    # Try toolchain-selected compiler to derive a matching nm.
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+    with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+        try:
+            cc, _, _ = _find_toolchain(pe, arch, cc_override=cc_override,
+                                       toolchain_hint=toolchain_hint)
+            pfx = _infer_tool_prefix_from_cc(cc)
+            if pfx:
+                candidates += [pfx + "nm", pfx + "llvm-nm"]
+        except SystemExit:
+            pass
+
+    # Arch/format family fallbacks.
+    if pe and arch == "x86_64":
+        candidates += [
+            "x86_64-w64-mingw32-nm",
+            "x86_64-unknown-w64-mingw32-nm",
+        ]
+    if (not pe) and arch == "x86_64":
+        candidates += [
+            "x86_64-linux-gnu-nm",
+            "x86_64-pc-linux-gnu-nm",
+            "x86_64-unknown-linux-gnu-nm",
+        ]
+    if (not pe) and arch == "aarch64":
+        candidates += [
+            "aarch64-linux-gnu-nm",
+            "aarch64-none-linux-gnu-nm",
+            "aarch64-unknown-linux-gnu-nm",
+            "aarch64-linux-android-nm",
+            "llvm-nm",
+        ]
+
+    candidates += ["llvm-nm", "nm"]
+    for c in _dedupe_keep_order(candidates):
+        found = _resolve_exe(c)
+        if found:
+            return found
+    return ""
+
+
+def _parse_nm_symbol_address(nm_stdout: str, symbol: str) -> int | None:
+    """
+    Parse nm output and return resolved symbol VA/address when available.
+    """
+    for raw in nm_stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+
+        # Common forms:
+        #   0000000140001500 T encrypt_block
+        #   0000000000401130 t hook_me
+        addr_tok = parts[0]
+        name_tok = parts[-1]
+        if name_tok != symbol:
+            continue
+        if re.fullmatch(r"[0-9A-Fa-f]+", addr_tok):
+            return int(addr_tok, 16)
+    return None
+
+
+def _resolve_symbol_address(binary_path: Path, symbol: str, fmt: str, arch: str,
+                            cc_override: str = "", toolchain_hint: str = "auto") -> int:
+    pe = (fmt == "PE")
+    nm_bin = _find_nm_tool(pe, arch, cc_override=cc_override, toolchain_hint=toolchain_hint)
+    if not nm_bin:
+        print("[!] Could not find nm/llvm-nm to resolve --at-symbol.")
+        print("    Provide --at explicitly, or install nm/llvm-nm tools.")
+        sys.exit(1)
+
+    nm = subprocess.run([nm_bin, str(binary_path)], capture_output=True, text=True)
+    if nm.returncode != 0:
+        print(f"[!] Symbol scan failed with {Path(nm_bin).name}:")
+        print((nm.stderr or nm.stdout).strip() or "    (no output)")
+        print("    Provide --at explicitly, or use a binary with symbols.")
+        sys.exit(1)
+
+    for cand in (symbol, "_" + symbol):
+        va = _parse_nm_symbol_address(nm.stdout, cand)
+        if va is not None:
+            print(f"[*] Resolved symbol {cand!r} -> 0x{va:x} via {Path(nm_bin).name}")
+            return va
+
+    print(f"[!] Symbol not found: {symbol!r}")
+    print("    The binary may be stripped or the symbol name may differ.")
+    print("    Provide --at explicitly, or check with:")
+    print(f"      {Path(nm_bin).name} {binary_path}")
+    sys.exit(1)
+
+
+def _build_bootstrap_commands() -> list[list[str]]:
+    sysname = platform.system()
+    cmds: list[list[str]] = []
+
+    if sysname == "Windows":
+        if _resolve_exe("winget"):
+            cmds.append([
+                "winget", "install", "-e", "--id", "LLVM.LLVM",
+                "--accept-package-agreements", "--accept-source-agreements"
+            ])
+            cmds.append([
+                "winget", "install", "-e", "--id", "MSYS2.MSYS2",
+                "--accept-package-agreements", "--accept-source-agreements"
+            ])
+        elif _resolve_exe("choco"):
+            cmds.append(["choco", "install", "-y", "llvm", "mingw"])
+        elif _resolve_exe("scoop"):
+            cmds.append(["scoop", "install", "llvm", "mingw"])
+        return cmds
+
+    if sysname == "Linux":
+        if _resolve_exe("apt-get"):
+            cmds.append([
+                "sudo", "apt-get", "update"
+            ])
+            cmds.append([
+                "sudo", "apt-get", "install", "-y",
+                "build-essential", "clang", "lld", "llvm", "binutils",
+                "gcc-mingw-w64-x86-64", "binutils-mingw-w64-x86-64"
+            ])
+        elif _resolve_exe("dnf"):
+            cmds.append([
+                "sudo", "dnf", "install", "-y",
+                "gcc", "clang", "lld", "llvm", "binutils", "mingw64-gcc"
+            ])
+        elif _resolve_exe("pacman"):
+            cmds.append([
+                "sudo", "pacman", "-S", "--needed", "--noconfirm",
+                "base-devel", "clang", "lld", "llvm", "binutils", "mingw-w64-gcc"
+            ])
+        return cmds
+
+    if sysname == "Darwin":
+        if _resolve_exe("brew"):
+            cmds.append(["brew", "install", "llvm", "mingw-w64", "binutils"])
+        return cmds
+
+    return cmds
+
+
+def _bootstrap(yes: bool = False) -> int:
+    print("[*] bpatch bootstrap")
+    print(f"[*] host: {platform.system()} {platform.machine()}")
+    print()
+
+    cmds = _build_bootstrap_commands()
+    if not cmds:
+        print("[!] No known package-manager bootstrap path for this host.")
+        print("    Use --doctor to inspect missing toolchains and install manually.")
+        return _doctor()
+
+    print("[*] Planned bootstrap commands:")
+    for c in cmds:
+        print("    " + " ".join(c))
+    print()
+
+    if not yes:
+        print("[*] Dry-run only. Re-run with --yes to execute these commands.")
+        print()
+        return _doctor()
+
+    for c in cmds:
+        print("[*] Running: " + " ".join(c))
+        r = subprocess.run(c, capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"[!] Command failed (exit {r.returncode}): {' '.join(c)}")
+            err = (r.stderr or "").strip()
+            out = (r.stdout or "").strip()
+            if err:
+                print(err)
+            elif out:
+                print(out)
+            print("[*] Continuing with remaining bootstrap commands...")
+
+    print()
+    return _doctor()
+
+
+def _pick_host_selftest_profile() -> tuple[str, str]:
+    sysname = platform.system()
+    mach = platform.machine().lower()
+    if sysname == "Windows":
+        if any(k in mach for k in ("amd64", "x86_64")):
+            return "PE", "x86_64"
+        print(f"[!] --self-test on Windows currently supports only x86_64 hosts (got {mach}).")
+        sys.exit(1)
+    if sysname == "Linux":
+        if any(k in mach for k in ("amd64", "x86_64")):
+            return "ELF", "x86_64"
+        if any(k in mach for k in ("aarch64", "arm64")):
+            return "ELF", "aarch64"
+        print(f"[!] --self-test on Linux supports x86_64/aarch64 hosts (got {mach}).")
+        sys.exit(1)
+    print(f"[!] --self-test is not supported on {sysname} yet.")
+    sys.exit(1)
+
+
+def _find_host_c_compiler(pe: bool, arch: str) -> str:
+    # Prefer generic host compilers first for runnable local binaries.
+    base = ["cc", "gcc", "clang"]
+    if pe:
+        base = ["gcc", "clang", "cc", "x86_64-w64-mingw32-gcc", "x86_64-unknown-w64-mingw32-gcc"]
+    base += ["gcc-14", "gcc-13", "gcc-12", "clang-19", "clang-18", "clang-17", "clang-16"]
+
+    for cand in _dedupe_keep_order(base):
+        found = _resolve_exe(cand)
+        if found:
+            return found
+
+    # Fall back to payload toolchain selection if needed.
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+    with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+        try:
+            cc, _, _ = _find_toolchain(pe, arch)
+            return cc
+        except SystemExit:
+            pass
+
+    print("[!] Could not find a host C compiler for --self-test.")
+    print("    Run:  bpatch.py --bootstrap  (or install gcc/clang manually)")
+    sys.exit(1)
+
+
+def _self_test(toolchain_hint: str = "auto", target_override: str = "",
+               cc_override: str = "", ld_override: str = "", objcopy_override: str = "") -> int:
+    fmt, arch = _pick_host_selftest_profile()
+    pe = (fmt == "PE")
+    print(f"[*] Running self-test profile: {fmt} {arch}")
+
+    host_cc = _find_host_c_compiler(pe, arch)
+    print(f"[*] Host compiler for target build: {host_cc}")
+
+    with tempfile.TemporaryDirectory(prefix="bpatch_selftest_") as td:
+        tdir = Path(td)
+        target_c = tdir / "selftest_target.c"
+        payload_c = tdir / "selftest_payload.c"
+        target_bin = tdir / ("selftest_target.exe" if pe else "selftest_target")
+        patched_bin = tdir / ("selftest_target.patched.exe" if pe else "selftest_target.patched")
+        marker = tdir / "selftest_marker.txt"
+
+        marker_literal = str(marker).replace("\\", "\\\\")
+        if pe:
+            payload_src = f"""\
+void payload(void) {{
+    char out[] = "{marker_literal}";
+    dump_str(ARG1_PTR(char), out);
+}}
+"""
+        else:
+            payload_src = f"""\
+void payload(void) {{
+    char out[] = "{marker_literal}";
+    dump_str(ARG1_PTR(char), out);
+}}
+"""
+
+        target_src = """\
+#include <stdio.h>
+#include <string.h>
+
+#if defined(_MSC_VER)
+#define BP_NOINLINE __declspec(noinline)
+#else
+#define BP_NOINLINE __attribute__((noinline))
+#endif
+
+BP_NOINLINE int hook_me(const char *msg) {
+    volatile int n = (int)strlen(msg);
+    return n + 7;
+}
+
+int main(void) {
+    const char *s = "BPATCH_SELFTEST";
+    int v = hook_me(s);
+    printf("SELFTEST:%d\\n", v);
+    return 0;
+}
+"""
+
+        target_c.write_text(target_src, encoding="utf-8")
+        payload_c.write_text(payload_src, encoding="utf-8")
+
+        cc_cmd = [host_cc, "-O0", "-fno-stack-protector", str(target_c), "-o", str(target_bin)]
+        if (not pe):
+            cc_cmd.insert(1, "-no-pie")
+        print("[*] Building self-test target...")
+        r = subprocess.run(cc_cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            print("[!] Self-test target build failed:")
+            print(r.stderr or r.stdout)
+            return 1
+
+        if marker.exists():
+            marker.unlink()
+
+        print("[*] Running baseline target...")
+        base = subprocess.run([str(target_bin)], capture_output=True, text=True, cwd=str(tdir))
+        if base.returncode != 0:
+            print("[!] Baseline target run failed.")
+            print(base.stderr or base.stdout)
+            return 1
+        base_out = base.stdout.strip()
+        print(f"[*] Baseline output: {base_out}")
+
+        target_va = _resolve_symbol_address(
+            target_bin, "hook_me", fmt, arch,
+            cc_override=host_cc, toolchain_hint=toolchain_hint
+        )
+
+        print("[*] Injecting payload into self-test target...")
+        inject(
+            target_bin, target_va, payload_c, patched_bin,
+            cc_override=cc_override, ld_override=ld_override, objcopy_override=objcopy_override,
+            payload_opt="O2", payload_cflags=None, payload_ldflags=None,
+            toolchain_hint=toolchain_hint, target_override=target_override
+        )
+
+        print("[*] Running patched target...")
+        patched = subprocess.run([str(patched_bin)], capture_output=True, text=True, cwd=str(tdir))
+        if patched.returncode != 0:
+            print("[!] Patched target run failed.")
+            print(patched.stderr or patched.stdout)
+            return 1
+        patched_out = patched.stdout.strip()
+        print(f"[*] Patched output: {patched_out}")
+
+        if base_out != patched_out:
+            print("[!] Self-test failed: patched output differs from baseline.")
+            return 1
+        if not marker.exists():
+            print("[!] Self-test failed: payload marker file not written.")
+            return 1
+        marker_text = marker.read_text(encoding="utf-8", errors="replace").strip()
+        if marker_text != "BPATCH_SELFTEST":
+            print("[!] Self-test failed: payload marker contents unexpected.")
+            print(f"    got: {marker_text!r}")
+            return 1
+
+        print("[+] Self-test passed.")
+        print(f"    marker: {marker}")
+        return 0
+
+
+def _doctor() -> int:
+    print("[*] bpatch toolchain doctor")
+    print(f"[*] host: {platform.system()} {platform.machine()}")
+    print()
+
+    checks = [
+        ("ELF x86_64", False, "x86_64"),
+        ("ELF aarch64", False, "aarch64"),
+        ("PE x86_64", True, "x86_64"),
+    ]
+
+    any_ok = False
+    for label, pe, arch in checks:
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        ok = False
+        cc = ld_ = oc = ""
+        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+            try:
+                cc, ld_, oc = _find_toolchain(pe, arch)
+                ok = True
+            except SystemExit:
+                ok = False
+
+        if ok:
+            any_ok = True
+            link_mode = "ld" if ld_ else "cc-driver"
+            print(f"[OK]   {label:12s}  cc={cc}  ld={ld_ or '(compiler driver)'}  "
+                  f"objcopy={oc}  link-mode={link_mode}")
+        else:
+            details = (out_buf.getvalue() + "\n" + err_buf.getvalue()).splitlines()
+            reason = next((ln.strip() for ln in details if ln.strip().startswith("[!]")),
+                          "toolchain not found")
+            print(f"[MISS] {label:12s}  {reason}")
+
+    print()
+    if any_ok:
+        print("[+] At least one payload toolchain is ready.")
+        print("    Use --toolchain gcc|clang to prefer a compiler family when both are installed.")
+        print("    Use --cc/--ld/--objcopy or BPATCH_* env vars to pin exact tools.")
+        return 0
+    print("[!] No usable payload toolchains were detected.")
+    return 1
+
+
 # ==============================================================================
 #  CLI
 # ==============================================================================
@@ -1596,6 +2312,10 @@ def main():
             sys.stderr.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+
+    default_toolchain = os.environ.get("BPATCH_TOOLCHAIN", "auto").strip().lower()
+    if default_toolchain not in ("auto", "gcc", "clang"):
+        default_toolchain = "auto"
 
     ap = argparse.ArgumentParser(
         description="bpatch - static binary injection tool for malware analysis",
@@ -1617,9 +2337,17 @@ examples:
   # Switch payload compiler and optimization level explicitly
   bpatch.py target.elf --at 0x401234 --payload dump_string.c --cc clang --payload-opt Oz
   bpatch.py target.exe --at 0x140001234 --payload dump_string_win.c --cc x86_64-w64-mingw32-gcc
+  bpatch.py target.exe --at 0x140001234 --payload dump_string_win.c --cc clang --payload-cflag -Wall --payload-ldflag --no-relax
+  bpatch.py target.exe --at 0x140001234 --payload dump_string_win.c --toolchain clang --target x86_64-w64-windows-gnu
 
   # Re-patch an already patched binary (chains hooks)
-  bpatch.py stress_patched.exe --at 0x140001450 --payload stress_payload_win.c -o stress_patched2.exe
+  bpatch.py targets/bin/stress_patched.exe --at 0x140001450 --payload stress_payload_win.c -o targets/bin/stress_patched2.exe
+
+  # Check which toolchains are available on this machine
+  bpatch.py --doctor
+  bpatch.py --bootstrap
+  bpatch.py --bootstrap --yes
+  bpatch.py --self-test
 
   # Dump the runtime header so you can write your own payload
   bpatch.py --dump-header --pe       (Windows)
@@ -1635,6 +2363,8 @@ examples:
     ap.add_argument("--at",           metavar="ADDR",
                     help="Injection address in hex, including imagebase "
                          "(e.g. 0x140001234 as shown in IDA / x64dbg)")
+    ap.add_argument("--at-symbol",    metavar="NAME",
+                    help="Resolve injection address from symbol name via nm (e.g. hook_me)")
     ap.add_argument("--payload",      metavar="FILE.c",
                     help="C payload source file (see --list for examples)")
     ap.add_argument("-o", "--output", metavar="OUT",
@@ -1653,16 +2383,65 @@ examples:
                     help="Payload linker override (optional)")
     ap.add_argument("--objcopy",      metavar="OBJCOPY",
                     help="Payload objcopy override (optional)")
+    ap.add_argument("--toolchain",    choices=("auto", "gcc", "clang"),
+                    default=default_toolchain,
+                    help="Preferred compiler family for payload builds (default: auto)")
+    ap.add_argument("--target",       metavar="TRIPLE",
+                    help="Override compiler target triple (e.g. x86_64-w64-windows-gnu)")
     ap.add_argument("--payload-opt",  choices=("O0", "O1", "O2", "O3", "Os", "Oz"),
                     default="O2",
                     help="Payload optimization level (default: O2)")
+    ap.add_argument("--payload-cflag", action="append", default=[], metavar="FLAG",
+                    help="Additional C compiler flag for payload build (repeatable)")
+    ap.add_argument("--payload-ldflag", action="append", default=[], metavar="FLAG",
+                    help="Additional linker flag for payload build (repeatable)")
     ap.add_argument("--list",         action="store_true",
                     help="List available example payloads and exit")
+    ap.add_argument("--doctor",       action="store_true",
+                    help="Check available payload toolchains and exit")
+    ap.add_argument("--bootstrap",    action="store_true",
+                    help="Install/prepare toolchains for this host (dry-run unless --yes)")
+    ap.add_argument("--yes",          action="store_true",
+                    help="Confirm command execution for --bootstrap")
+    ap.add_argument("--self-test",    action="store_true",
+                    help="Build, patch, and run a tiny local validation target")
     args = ap.parse_args()
+
+    mode_count = sum(bool(x) for x in (
+        args.list, args.doctor, args.dump_header, args.bootstrap, args.self_test
+    ))
+    if mode_count > 1:
+        print("[!] Choose only one mode at a time: --list / --doctor / --dump-header / "
+              "--bootstrap / --self-test")
+        sys.exit(1)
 
     # ---- info-only modes ----
     if args.list:
         _list_examples()
+        return
+
+    if args.doctor:
+        rc = _doctor()
+        if rc != 0:
+            sys.exit(rc)
+        return
+
+    if args.bootstrap:
+        rc = _bootstrap(yes=args.yes)
+        if rc != 0:
+            sys.exit(rc)
+        return
+
+    if args.self_test:
+        rc = _self_test(
+            toolchain_hint=args.toolchain,
+            target_override=(args.target or os.environ.get("BPATCH_TARGET", "").strip()),
+            cc_override=(args.cc or ""),
+            ld_override=(args.ld or ""),
+            objcopy_override=(args.objcopy or "")
+        )
+        if rc != 0:
+            sys.exit(rc)
         return
 
     if args.dump_header:
@@ -1684,7 +2463,11 @@ examples:
     # ---- validate args ----
     missing = []
     if not args.binary:  missing.append("binary")
-    if not args.at:      missing.append("--at")
+    if not args.at and not args.at_symbol:
+        missing.append("--at/--at-symbol")
+    if args.at and args.at_symbol:
+        print("[!] Use either --at or --at-symbol, not both.")
+        sys.exit(1)
     if not args.payload: missing.append("--payload")
     if missing:
         ap.print_help()
@@ -1694,12 +2477,6 @@ examples:
         sys.exit(1)
 
     # ---- parse + validate inputs ----
-    try:
-        target_va = int(args.at, 16)
-    except ValueError:
-        print(f"[!] Invalid address: {args.at!r}  (expected hex, e.g. 0x140001234)")
-        sys.exit(1)
-
     binary_path  = Path(args.binary)
     payload_path = Path(args.payload)
 
@@ -1718,6 +2495,20 @@ examples:
         print(f"[!] Binary not found: {binary_path}")
         sys.exit(1)
 
+    if args.at:
+        try:
+            target_va = int(args.at, 16)
+        except ValueError:
+            print(f"[!] Invalid address: {args.at!r}  (expected hex, e.g. 0x140001234)")
+            sys.exit(1)
+    else:
+        fmt = _detect_format(binary_path)
+        arch = _detect_arch(binary_path, fmt)
+        target_va = _resolve_symbol_address(
+            binary_path, args.at_symbol, fmt, arch,
+            cc_override=(args.cc or ""), toolchain_hint=args.toolchain
+        )
+
     if args.output:
         out = Path(args.output)
     else:
@@ -1733,7 +2524,11 @@ examples:
            cc_override=(args.cc or ""),
            ld_override=(args.ld or ""),
            objcopy_override=(args.objcopy or ""),
-           payload_opt=args.payload_opt)
+           payload_opt=args.payload_opt,
+           payload_cflags=args.payload_cflag,
+           payload_ldflags=args.payload_ldflag,
+           toolchain_hint=args.toolchain,
+           target_override=(args.target or os.environ.get("BPATCH_TARGET", "").strip()))
     print(f"\n[+] Done. Patched binary: {out}")
     print(f"    Original is unchanged:  {binary_path}")
 

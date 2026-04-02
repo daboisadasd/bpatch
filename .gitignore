@@ -1,2 +1,16 @@
-katana/
+__pycache__/
+*.py[cod]
+*$py.class
+
+.venv/
+venv/
+env/
+
+# Local build artifacts
+targets/bin/
+*.patched
+
+# Large local workflows / snapshots
+tools/katana/
+archive/
 
