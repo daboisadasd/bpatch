@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bpatch"
+version = "0.3.0"
+description = "Static binary patching tool for malware analysis and reverse engineering"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "lief>=0.15",
+    "capstone>=5.0",
+    "keystone-engine>=0.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.0",
+]
+
+[project.scripts]
+bpatch = "bpatch.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["bpatch*", "bpatch_arch*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "integration: end-to-end tests requiring full toolchain (deselect with -m 'not integration')",
+    "linux: tests that must run on a Linux host",
+    "windows: tests that must run on a Windows host",
+    "ssh: tests executed on a remote host via SSH",
+]
