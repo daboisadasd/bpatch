@@ -1,14 +1,27 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.egg-info/
 
 .venv/
 venv/
 env/
 
+# IDE / tooling
+.serena/
+.pytest_cache/
+.mypy_cache/
+
 # Local build artifacts
 targets/bin/
 *.patched
+*.patched.exe
+*.unpatched
+*.unpatched.exe
+
+# Loose test binaries at repo root
+test_hello*.exe
+test_hello*.elf
 
 # Large local workflows / snapshots
 tools/katana/

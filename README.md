@@ -1,109 +1,285 @@
 # bpatch
 
-`bpatch` is a static binary patching tool for malware analysis and reverse engineering workflows.
-It patches a callsite so execution jumps into an injected trampoline, runs a user C payload, then resumes original code.
+Static binary instrumentation for malware analysis and reverse engineering.
 
-## Start Here (New to Reverse Engineering)
+bpatch injects a C payload into an existing binary without source code.
+At the patch site, execution jumps to the injected section, your payload runs
+with full access to all CPU registers, then original execution resumes.
+No OS hooks, no DLL injection, no debug API — the patch is entirely inside
+the binary on disk.
 
-1. Read [docs/START_HERE.md](docs/START_HERE.md)
-2. Follow [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)
-3. Run `python bpatch.py --bootstrap` and `python bpatch.py --doctor`
-4. Run `python bpatch.py --self-test`
-5. Do the hands-on lab in [docs/FIRST_PATCH_WALKTHROUGH.md](docs/FIRST_PATCH_WALKTHROUGH.md)
+**Supported targets**
 
-## Documentation Map
+| Format | Architecture | Platform |
+|--------|-------------|----------|
+| ELF    | x86_64      | Linux, Android |
+| ELF    | aarch64     | Linux, Android |
+| PE     | x86_64      | Windows |
+| PE     | aarch64     | Windows on ARM |
 
-- [docs/INDEX.md](docs/INDEX.md) - Structured learning path and full doc index
-- [docs/START_HERE.md](docs/START_HERE.md) - Big picture, mindset, and workflow overview
-- [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) - Fresh-machine setup and first successful run
-- [docs/REVERSE_ENGINEERING_PRIMER.md](docs/REVERSE_ENGINEERING_PRIMER.md) - Core RE concepts you need for bpatch
-- [docs/FIRST_PATCH_WALKTHROUGH.md](docs/FIRST_PATCH_WALKTHROUGH.md) - Step-by-step first patch lab
-- [docs/CLI_REFERENCE.md](docs/CLI_REFERENCE.md) - Full command and option guide
-- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) - Common errors and fixes
-- [docs/FAQ.md](docs/FAQ.md) - Practical questions and answers
-- [docs/SECURITY_AND_ETHICS.md](docs/SECURITY_AND_ETHICS.md) - Safe and authorized usage rules
-- [docs/STRESS_TEST.md](docs/STRESS_TEST.md) - Stress test for patch correctness
+---
 
-## Current Support
+## Installation
 
-- ELF: `x86_64`, `aarch64` (Linux/Android)
-- PE: `x86_64` (Windows)
+Requires Python 3.11+ and a C toolchain (clang or gcc).
 
-## Key Features
-
-- Format auto-detection (ELF vs PE)
-- Injection by address (`--at`) or symbol (`--at-symbol`)
-- Auto toolchain discovery with override controls
-- Bootstrap and diagnostics commands (`--bootstrap`, `--doctor`)
-- End-to-end smoke validation (`--self-test`)
-- Re-patching support (chained hooks)
-
-## Quick Start
-
-Install Python dependencies:
-
-```bash
-pip install -r requirements.txt
+```
+pip install -e .
 ```
 
-Check/prepare toolchains:
+Check what toolchains were found and whether everything is wired up:
 
-```bash
-python bpatch.py --bootstrap
-python bpatch.py --bootstrap --yes
-python bpatch.py --doctor
+```
+python -m bpatch --doctor
+python -m bpatch --bootstrap      # show install commands
+python -m bpatch --bootstrap --yes # run them
+python -m bpatch --self-test       # compile + inject + run a local sanity check
 ```
 
-Validate your setup end-to-end:
+---
 
-```bash
-python bpatch.py --self-test
+## Quick start
+
+Patch at an explicit virtual address:
+
+```
+python -m bpatch target.elf  --at 0x401234    --payload examples/trace_args.c
+python -m bpatch target.exe  --at 0x140001234 --payload examples/trace_args_win.c
 ```
 
-Patch using explicit address:
+Patch by symbol name (binary must have debug symbols):
 
-```bash
-python bpatch.py <binary> --at <hex_address> --payload <payload.c> -o <output>
+```
+python -m bpatch target.elf  --at-symbol hook_me   --payload examples/hexdump_arg.c
+python -m bpatch target.dll  --at-symbol CreateFile --payload examples/trace_args_win.c
 ```
 
-Patch using symbol lookup:
+Patch by PE export name (works on stripped DLLs):
 
-```bash
-python bpatch.py <binary> --at-symbol <symbol_name> --payload <payload.c> -o <output>
+```
+python -m bpatch target.exe --at-export CreateFileW  --payload examples/trace_args_win.c
+python -m bpatch target.dll --at-export DllGetVersion --payload examples/log_regs_win.c
 ```
 
-## Toolchain Selection
+Patch by byte pattern (most powerful — works on packed/stripped binaries):
 
-Default behavior is to use whatever suitable compiler toolchain is already installed.
+```
+python -m bpatch target.exe --at-pattern "48 89 5C 24 ?? 57 48 83 EC 20" \
+    --payload examples/trace_args_win.c
 
-Optional controls:
+# Pattern found at 3 sites — hook the second one:
+python -m bpatch target.exe --at-pattern "55 48 89 E5 ?? ?? ?? ??" \
+    --at-pattern-nth 2 --payload examples/hexdump_arg_win.c
+```
 
-- `--toolchain auto|gcc|clang`
-- `--cc`, `--ld`, `--objcopy`
-- `--target <triple>`
-- `--payload-cflag` (repeatable)
-- `--payload-ldflag` (repeatable)
+Patch by RVA (address without imagebase):
 
-Environment overrides:
+```
+python -m bpatch target.exe --at-rva 0x16c0 --payload examples/log_regs_win.c
+```
 
-- Global: `BPATCH_CC`, `BPATCH_LD`, `BPATCH_OBJCOPY`
-- Preference: `BPATCH_TOOLCHAIN` (`auto`, `gcc`, `clang`)
-- Target triple: `BPATCH_TARGET`
-- Scoped: `BPATCH_ELF_X86_64_*`, `BPATCH_ELF_AARCH64_*`, `BPATCH_PE_X86_64_*`
-- Extra flags: `BPATCH_PAYLOAD_CFLAGS`, `BPATCH_PAYLOAD_LDFLAGS`
+---
 
-## Repository Layout
+## Revert a patch
 
-- `bpatch.py` - main CLI and patching logic
-- `bpatch_arch/` - architecture-specific backend logic
-- `examples/` - ready-to-use payloads
-- `docs/` - full documentation for beginners and advanced usage
-- `include/` - runtime headers
-- `targets/src/` - sample target source files
-- `targets/bin/` - locally built sample binaries (gitignored)
-- `tools/` - helper workflows/scripts
+Every injection embeds a 32-byte undo header in the `.inj` section.
+To restore the original binary:
 
-## Usage Scope
+```
+python -m bpatch target.exe --undo -o target_clean.exe
+```
 
-This project is for authorized analysis and research use.
+---
+
+## Multi-site injection
+
+Inject multiple payloads in one command using a JSON spec:
+
+```json
+[
+  {
+    "at_export": "CreateFileW",
+    "payload": "examples/trace_args_win.c",
+    "comment": "log filenames opened"
+  },
+  {
+    "at_export": "RegOpenKeyExW",
+    "payload": "examples/trace_args_win.c",
+    "comment": "log registry reads"
+  },
+  {
+    "at_pattern": "FF 15 ?? ?? ?? ?? 85 C0 74",
+    "payload": "examples/force_return_0_win.c",
+    "comment": "bypass licence check"
+  }
+]
+```
+
+```
+python -m bpatch malware.exe --sites sites.json -o malware_instrumented.exe
+```
+
+Sites are applied sequentially; each writes an intermediate binary that
+the next site reads. Any address format (`at`, `at_rva`, `at_symbol`,
+`at_export`, `at_pattern`, `at_pattern_nth`) works inside the JSON.
+
+---
+
+## Hook chaining
+
+Re-inject a site that was already patched:
+
+```
+python -m bpatch target.exe --at 0x140001234 --payload second_hook.c --chain
+```
+
+Without `--chain`, bpatch warns you when the site already begins with a JMP.
+With `--chain`, it injects anyway — the new payload runs before the old one
+because the trampoline it installs executes the old JMP as a stolen instruction.
+
+---
+
+## Example payloads
+
+All payloads live in `examples/`. Linux and Windows variants exist for each.
+
+| Payload | What it does |
+|---------|-------------|
+| `trace_args.c` / `_win.c` | Log all argument registers per call |
+| `hexdump_arg.c` / `_win.c` | Hex+ASCII dump of the buffer at ARG1 |
+| `dump_string.c` / `_win.c` | Dump a null-terminated string from ARG1 |
+| `dump_bytes_win.c` | Dump a length-prefixed buffer (ARG1=ptr, ARG2=len) |
+| `count_hits.c` / `_win.c` | Running call counter stored in the payload section |
+| `force_return_0.c` / `_win.c` | Override return value to 0 (bypass checks) |
+| `patch_retval_win.c` | Log and override a function's return value |
+| `log_regs_win.c` | Log all 16 GP registers on each hit |
+| `network_log_win.c` | Capture send() buffer content (C2 traffic) |
+
+Show the full list with descriptions:
+
+```
+python -m bpatch --list
+```
+
+Write the runtime header to the current directory for payload development:
+
+```
+python -m bpatch --dump-header                   # Linux x86_64
+python -m bpatch --dump-header --arch aarch64    # Linux aarch64
+python -m bpatch --dump-header --pe              # Windows x64
+python -m bpatch --dump-header --pe --arch aarch64  # Windows ARM64
+```
+
+---
+
+## Writing a payload
+
+A payload is a plain C file. The only required function is `payload()`.
+
+```c
+#include "bpatch_rt.h"
+
+void payload(void) {
+    // ARG1..ARG6 are the function arguments (rdi/rsi/... on Linux x64)
+    // RETVAL is rax / x0 — write to it to override the return value
+    char path[] = "/tmp/out.txt";
+    LOG_REG("arg1", ARG1, path);
+    LOG_REG("arg2", ARG2, path);
+}
+```
+
+bpatch rewrites `void payload()` to `void payload(ctx_t *ctx)` and injects
+`ctx` automatically. Registers are saved before your payload runs and restored
+after — writing to `ctx->rax` (or `RETVAL`) takes effect when execution resumes.
+
+**Rules:**
+- No libc, no includes except `bpatch_rt.h`
+- No PLT/GOT calls — all helpers must be inlined (the runtime header handles this)
+- Use `char arr[] = "..."` for string literals, not `char *p = "..."` (the latter
+  references `.rodata` outside the injected section and will crash)
+- The payload is compiled with `-ffreestanding -fno-builtin -fno-stack-protector`
+
+---
+
+## Compiler flags
+
+```
+--payload-opt O0|O1|O2|O3|Os|Oz   optimisation level (default O2)
+--lto                              link-time optimisation; smaller payloads (clang+lld)
+--payload-debug                    include debug symbols and force O0
+--payload-sections                 -ffunction-sections + --gc-sections (dead code removal)
+--payload-cflag FLAG               extra C compiler flag (repeatable)
+--payload-ldflag FLAG              extra linker flag (repeatable)
+```
+
+---
+
+## Toolchain reference
+
+bpatch auto-discovers available toolchains.
+Override with flags or environment variables when needed.
+
+**Flags**
+
+```
+--toolchain auto|gcc|clang    prefer a compiler family (default: auto, tries clang first)
+--cc COMPILER                 explicit compiler binary
+--ld LINKER                   explicit linker binary
+--objcopy OBJCOPY             explicit objcopy binary
+--target TRIPLE               compiler target triple (e.g. aarch64-linux-gnu)
+```
+
+**Environment variables**
+
+```
+BPATCH_TOOLCHAIN      auto | gcc | clang
+BPATCH_CC             explicit compiler path
+BPATCH_LD             explicit linker path
+BPATCH_OBJCOPY        explicit objcopy path
+BPATCH_TARGET         target triple
+BPATCH_PAYLOAD_CFLAGS   extra C flags (space-separated)
+BPATCH_PAYLOAD_LDFLAGS  extra linker flags (space-separated)
+```
+
+Scoped overrides (take priority over global ones):
+
+```
+BPATCH_ELF_X86_64_CC
+BPATCH_ELF_AARCH64_CC
+BPATCH_PE_X86_64_CC
+BPATCH_PE_AARCH64_CC
+```
+
+---
+
+## Other options
+
+```
+--dry-run        show injection layout without writing the output binary
+--chain          re-hook a site that already begins with a JMP
+--undo           revert all bpatch injections using embedded undo headers
+-o OUTPUT        output path (default: <binary>.patched[.exe])
+-q / --quiet     suppress informational lines; show only results and errors
+--version        print version and exit
+```
+
+---
+
+## Repository layout
+
+```
+bpatch/            Python package — CLI, compiler, injector, pattern search, undo
+bpatch_arch/       Architecture backends (x86_64, aarch64) — trampoline assembly
+examples/          Ready-to-use payload C files
+docs/              Extended documentation and walkthroughs
+tests/             pytest unit and integration test suite
+bpatch.py          Thin shim: "python bpatch.py" also works
+pyproject.toml     Package metadata and test configuration
+```
+
+---
+
+## Usage scope
+
+This project is for authorized analysis and research use only.
 See [docs/SECURITY_AND_ETHICS.md](docs/SECURITY_AND_ETHICS.md).
