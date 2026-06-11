@@ -7,7 +7,8 @@ from pathlib import Path
 
 from .compiler import compile_payload
 from .errors import BpatchInjectError
-from .log import info, ok
+from .log import info, ok, warn
+from .undo import build_undo_header, UNDO_HDR_SIZE
 from .utils import align_up
 
 
@@ -31,6 +32,25 @@ def _next_inj_name(existing: set[str], base: str = ".inj") -> str:
     raise BpatchInjectError("Could not allocate a unique injection section name")
 
 
+def _is_patched(raw: bytes, target_va: int, seg_va: int, seg_foff: int) -> bool:
+    """Return True if the target site already begins with a JMP/B (already hooked)."""
+    off = seg_foff + (target_va - seg_va)
+    if off + 5 > len(raw):
+        return False
+    b = raw[off]
+    # x86_64: E9 (near JMP rel32), EB (short JMP rel8), FF 25 (indirect JMP)
+    if b in (0xE9, 0xEB):
+        return True
+    if b == 0xFF and off + 1 < len(raw) and raw[off + 1] == 0x25:
+        return True
+    # AArch64: B unconditional — top 6 bits = 0b000101
+    if off + 4 <= len(raw):
+        word = int.from_bytes(raw[off:off + 4], "little")
+        if (word >> 26) == 0b000101:
+            return True
+    return False
+
+
 def _is_uncond_branch(ins) -> bool:
     return getattr(ins, "mnemonic", "").lower() in ("jmp", "b", "br")
 
@@ -38,20 +58,24 @@ def _is_uncond_branch(ins) -> bool:
 def _print_layout(tgt_va, inj_va, prologue, epilogue, payload,
                   ret_va, inj_label: str = ".inj") -> None:
     ok(f"\n[+] Injection layout:")
-    ok(f"    0x{tgt_va:016x}  JMP -> {inj_label}  (patch site)")
-    ok(f"    0x{inj_va:016x}  prologue  ({len(prologue)} bytes)")
-    e = inj_va + len(prologue)
+    ok(f"    0x{tgt_va:016x}  JMP -> {inj_label}+0x{UNDO_HDR_SIZE:x}  (patch site)")
+    ok(f"    0x{inj_va:016x}  [undo header]  ({UNDO_HDR_SIZE} bytes; bpatch --undo to revert)")
+    p = inj_va + UNDO_HDR_SIZE
+    ok(f"    0x{p:016x}  prologue  ({len(prologue)} bytes)")
+    e = p + len(prologue)
     ok(f"    0x{e:016x}  epilogue  ({len(epilogue)} bytes)  <- ret lands here")
-    p = e + len(epilogue)
-    ok(f"    0x{p:016x}  payload   ({len(payload)} bytes)")
+    c = e + len(epilogue)
+    ok(f"    0x{c:016x}  payload   ({len(payload)} bytes)")
     ok(f"    -> 0x{ret_va:016x}  resume original")
 
 
-def _write_hook(binary, target_va: int, inject_va: int,
+def _write_hook(binary, target_va: int, section_va: int,
                 stolen_sz: int, arch: str) -> None:
+    """Write the entry JMP/B at target_va -> (section_va + UNDO_HDR_SIZE)."""
     backend = _get_backend(arch)
-    full, patch_len, nops = backend.make_entry_patch(target_va, inject_va, stolen_sz)
-    info(f"[*] patching 0x{target_va:x}  JMP -> 0x{inject_va:x}  "
+    code_start = section_va + UNDO_HDR_SIZE
+    full, patch_len, nops = backend.make_entry_patch(target_va, code_start, stolen_sz)
+    info(f"[*] patching 0x{target_va:x}  JMP -> 0x{code_start:x}  "
          f"({patch_len}B patch + {nops} NOP{'s' if nops != 1 else ''})")
     for i, bv in enumerate(full):
         binary.patch_address(target_va + i, bv)
@@ -76,6 +100,7 @@ def inject_elf(
     debug:            bool = False,
     sections:         bool = False,
     dry_run:          bool = False,
+    chain:            bool = False,
 ) -> None:
     import lief  # local import so tests can mock without a global import
 
@@ -97,6 +122,16 @@ def inject_elf(
     info(f"[+] target segment: va=0x{tgt_seg.virtual_address:x}  "
          f"foff=0x{tgt_seg.file_offset:x}")
 
+    # Detect already-patched sites
+    if _is_patched(raw, target_va, tgt_seg.virtual_address, tgt_seg.file_offset):
+        if not chain:
+            warn(
+                f"[!] 0x{target_va:x} already starts with a JMP/B — may already be hooked.\n"
+                "    Use --chain to inject anyway (new hook will chain through existing JMP)."
+            )
+        else:
+            info("[*] --chain: target already hooked; chaining new injection.")
+
     with tempfile.TemporaryDirectory() as tmp:
         payload_bytes, payload_off = compile_payload(
             payload_c, Path(tmp),
@@ -116,22 +151,32 @@ def inject_elf(
     )
     if stolen and _is_uncond_branch(stolen[0]):
         info("[*] Note: target begins with an unconditional branch; "
-             "re-patching will chain through previous hook code.")
+             "chaining through previous hook code.")
     return_va = target_va + stolen_sz
+
+    # Capture original bytes for undo header BEFORE any patching
+    patch_foff    = tgt_seg.file_offset + (target_va - tgt_seg.virtual_address)
+    original_bytes = raw[patch_foff: patch_foff + stolen_sz]
     print()
 
     max_va  = max(s.virtual_address + s.virtual_size for s in binary.segments)
     est_va  = align_up(max_va, 0x1000)
     info(f"[+] estimated .inj vaddr: 0x{est_va:x}")
 
+    # code_start = section_va + UNDO_HDR_SIZE  (prologue begins after the header)
+    code_start = est_va + UNDO_HDR_SIZE
     prologue, epilogue, content = backend.build_section_content(
-        est_va, payload_bytes, payload_off, stolen, return_va, abi="sysv"
+        code_start, payload_bytes, payload_off, stolen, return_va, abi="sysv"
     )
+
+    # Full section: [undo_hdr(32)][prologue][epilogue][payload]
+    undo_hdr     = build_undo_header(target_va, original_bytes)
+    full_content = undo_hdr + content
 
     sec         = lief.ELF.Section(inj_name)
     sec.type    = lief.ELF.Section.TYPE.PROGBITS
     sec.flags   = lief.ELF.Section.FLAGS.ALLOC | lief.ELF.Section.FLAGS.EXECINSTR
-    sec.content = list(content)
+    sec.content = list(full_content)
     sec.alignment = 0x10
     binary.add(sec, loaded=True)
 
@@ -144,12 +189,15 @@ def inject_elf(
 
     if real_va != est_va:
         info(f"[*] Regenerating for actual vaddr 0x{real_va:x}...")
+        code_start = real_va + UNDO_HDR_SIZE
         prologue, epilogue, content = backend.build_section_content(
-            real_va, payload_bytes, payload_off, stolen, return_va, abi="sysv"
+            code_start, payload_bytes, payload_off, stolen, return_va, abi="sysv"
         )
+        undo_hdr     = build_undo_header(target_va, original_bytes)
+        full_content = undo_hdr + content
         for s in binary.sections:
             if s.name == inj_name:
-                s.content = list(content)
+                s.content = list(full_content)
                 break
 
     _write_hook(binary, target_va, real_va, stolen_sz, arch)

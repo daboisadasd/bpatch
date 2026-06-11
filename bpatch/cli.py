@@ -13,11 +13,10 @@ from pathlib import Path
 
 from . import __version__
 from .errors import BpatchError
-from .inject import inject
+from .inject import inject, inject_sites, _detect, _resolve_target_va
 from .log import set_quiet, info, ok, warn
 from .selftest import self_test, doctor, bootstrap
 from .symbols import resolve_symbol_address
-from .inject import _detect
 
 
 # ---------------------------------------------------------------------------
@@ -107,14 +106,37 @@ examples:
     # --- positional / core ---
     ap.add_argument("binary",        nargs="?",
                     help="Target binary (.exe or ELF, auto-detected)")
-    ap.add_argument("--at",          metavar="ADDR",
+
+    # Address resolution — mutually exclusive group
+    addr_grp = ap.add_mutually_exclusive_group()
+    addr_grp.add_argument("--at",          metavar="ADDR",
                     help="Injection address in hex incl. imagebase (e.g. 0x140001234)")
-    ap.add_argument("--at-symbol",   metavar="NAME",
-                    help="Resolve injection address from symbol name via nm")
+    addr_grp.add_argument("--at-rva",      metavar="RVA",
+                    help="Injection RVA (hex) — imagebase is added automatically")
+    addr_grp.add_argument("--at-symbol",   metavar="NAME",
+                    help="Resolve injection address from debug symbol name via nm")
+    addr_grp.add_argument("--at-export",   metavar="NAME",
+                    help="Resolve injection address from PE export table (DLL/EXE)")
+    addr_grp.add_argument("--at-pattern",  metavar="PATTERN",
+                    help='Byte-pattern scan, e.g. "48 8B 05 ?? ?? ?? ??" '
+                         "(wildcards: ?? ? * --)")
+    ap.add_argument("--at-pattern-nth",    metavar="N", type=int, default=1,
+                    help="Which match to use when --at-pattern finds multiple "
+                         "results (1-based, default: 1)")
+
     ap.add_argument("--payload",     metavar="FILE.c",
                     help="C payload source file (see --list for examples)")
     ap.add_argument("-o", "--output",metavar="OUT",
                     help="Output path (default: <binary>.patched[.exe])")
+
+    # Multi-site injection
+    ap.add_argument("--sites",        metavar="SITES.json",
+                    help="JSON file describing multiple injection sites "
+                         "(overrides --at/--payload/--at-* for batch injection)")
+
+    # Undo
+    ap.add_argument("--undo",         action="store_true",
+                    help="Revert all bpatch injections in binary (uses embedded undo headers)")
 
     # --- toolchain ---
     ap.add_argument("--cc",          metavar="COMPILER",
@@ -149,6 +171,9 @@ examples:
                     help="Extra linker flag for payload build (repeatable)")
 
     # --- output control ---
+    ap.add_argument("--chain",        action="store_true",
+                    help="Allow hooking a site that already starts with a JMP "
+                         "(hook chaining — new payload runs before the old one)")
     ap.add_argument("--dry-run",     action="store_true",
                     help="Show injection layout without writing the output binary")
     ap.add_argument("-q", "--quiet", action="store_true",
@@ -220,6 +245,30 @@ def _run(ap: argparse.ArgumentParser, args) -> None:
         ap.error("Choose only one mode: --list / --doctor / --dump-header / "
                  "--bootstrap / --self-test")
 
+    # --undo is handled early (before injection path)
+    if getattr(args, "undo", False):
+        if not args.binary:
+            ap.error("--undo requires a binary argument")
+        binary_path = Path(args.binary)
+        if not binary_path.exists():
+            ap.error(f"Binary not found: {binary_path}")
+        if args.output:
+            out = Path(args.output)
+        else:
+            suf = ".exe" if binary_path.suffix.lower() == ".exe" else ""
+            out = binary_path.with_suffix(f".unpatched{suf}")
+        if out.resolve() == binary_path.resolve():
+            ap.error("Output path is the same as input. Use -o to specify a different path.")
+        from .undo import undo_elf, undo_pe
+        fmt, arch, _parsed = _detect(binary_path)
+        if fmt == "ELF":
+            n = undo_elf(binary_path, out, dry_run=args.dry_run)
+        else:
+            n = undo_pe(binary_path, out, dry_run=args.dry_run)
+        if n == 0:
+            sys.exit(1)
+        return
+
     # ---- info-only modes ----
     if args.list:
         _list_examples()
@@ -245,15 +294,17 @@ def _run(ap: argparse.ArgumentParser, args) -> None:
 
     if args.dump_header:
         from .runtime import (
-            BPATCH_RT_LINUX_H, BPATCH_RT_WIN64_H, BPATCH_RT_AARCH64_LINUX_H
+            BPATCH_RT_LINUX_H, BPATCH_RT_WIN64_H,
+            BPATCH_RT_AARCH64_LINUX_H, BPATCH_RT_WIN_ARM64_H,
         )
         if args.pe:
-            if args.arch != "x86_64":
-                ap.error("--dump-header --pe currently supports only --arch x86_64")
-            rt, name = BPATCH_RT_WIN64_H, "bpatch_rt_win64.h"
+            if args.arch == "x86_64":
+                rt, name = BPATCH_RT_WIN64_H,    "bpatch_rt_win64.h"
+            else:
+                rt, name = BPATCH_RT_WIN_ARM64_H, "bpatch_rt_win_arm64.h"
         else:
             if args.arch == "x86_64":
-                rt, name = BPATCH_RT_LINUX_H, "bpatch_rt.h"
+                rt, name = BPATCH_RT_LINUX_H,         "bpatch_rt.h"
             else:
                 rt, name = BPATCH_RT_AARCH64_LINUX_H, "bpatch_rt_aarch64.h"
         Path(name).write_text(rt, encoding="utf-8")
@@ -262,49 +313,14 @@ def _run(ap: argparse.ArgumentParser, args) -> None:
         return
 
     # ---- validate required args for injection ----
-    missing = []
-    if not args.binary:         missing.append("binary")
-    if not args.at and not args.at_symbol:
-        missing.append("--at or --at-symbol")
-    if args.at and args.at_symbol:
-        ap.error("Use either --at or --at-symbol, not both.")
-    if not args.payload:        missing.append("--payload")
-    if missing:
+    if not args.binary:
         ap.print_help()
         print()
-        ap.error(f"Missing required arguments: {', '.join(missing)}")
+        ap.error("Missing required argument: binary")
 
-    # ---- resolve paths ----
-    binary_path  = Path(args.binary)
-    payload_path = Path(args.payload)
-
-    if not payload_path.exists():
-        candidate = Path(__file__).parent.parent / "examples" / payload_path.name
-        if candidate.exists():
-            info(f"[*] Payload not found at {payload_path}, using {candidate}")
-            payload_path = candidate
-        else:
-            ap.error(
-                f"Payload not found: {payload_path}\n"
-                "Run  bpatch --list  to see available payloads."
-            )
-
+    binary_path = Path(args.binary)
     if not binary_path.exists():
         ap.error(f"Binary not found: {binary_path}")
-
-    # ---- resolve injection address ----
-    if args.at:
-        try:
-            target_va = int(args.at, 16)
-        except ValueError:
-            ap.error(f"Invalid address: {args.at!r}  (expected hex, e.g. 0x140001234)")
-    else:
-        fmt, arch, _ = _detect(binary_path)
-        target_va = resolve_symbol_address(
-            binary_path, args.at_symbol, fmt, arch,
-            cc_override   = args.cc or "",
-            toolchain_hint= args.toolchain,
-        )
 
     # ---- resolve output path ----
     if args.output:
@@ -316,9 +332,7 @@ def _run(ap: argparse.ArgumentParser, args) -> None:
     if out.resolve() == binary_path.resolve():
         ap.error("Output path is the same as input. Use -o to specify a different path.")
 
-    # ---- inject ----
-    inject(
-        binary_path, target_va, payload_path, out,
+    common_inject = dict(
         cc_override      = args.cc or "",
         ld_override      = args.ld or "",
         objcopy_override = args.objcopy or "",
@@ -331,6 +345,76 @@ def _run(ap: argparse.ArgumentParser, args) -> None:
         debug            = args.payload_debug,
         sections         = args.payload_sections,
         dry_run          = args.dry_run,
+        chain            = getattr(args, "chain", False),
+    )
+
+    # ---- multi-site mode ----
+    if getattr(args, "sites", None):
+        sites_path = Path(args.sites)
+        if not sites_path.exists():
+            ap.error(f"--sites file not found: {sites_path}")
+        n = inject_sites(binary_path, sites_path, out, **common_inject)
+        if not args.dry_run:
+            ok(f"\n[+] Done. {n} site(s) patched -> {out}")
+            ok(f"    Original is unchanged: {binary_path}")
+        else:
+            ok(f"\n[+] Dry run complete.")
+        return
+
+    # ---- single-site mode ----
+    has_addr = any([
+        args.at,
+        getattr(args, "at_rva", None),
+        args.at_symbol,
+        getattr(args, "at_export", None),
+        getattr(args, "at_pattern", None),
+    ])
+    if not has_addr:
+        ap.print_help()
+        print()
+        ap.error("Missing injection address: use one of "
+                 "--at / --at-rva / --at-symbol / --at-export / --at-pattern")
+    if not args.payload:
+        ap.print_help()
+        print()
+        ap.error("Missing required argument: --payload")
+
+    payload_path = Path(args.payload)
+    if not payload_path.exists():
+        candidate = Path(__file__).parent.parent / "examples" / payload_path.name
+        if candidate.exists():
+            info(f"[*] Payload not found at {payload_path}, using {candidate}")
+            payload_path = candidate
+        else:
+            ap.error(
+                f"Payload not found: {payload_path}\n"
+                "Run  bpatch --list  to see available payloads."
+            )
+
+    # ---- resolve injection address ----
+    fmt, arch, parsed = _detect(binary_path)
+    try:
+        target_va = _resolve_target_va(
+            binary_path,
+            at              = args.at,
+            at_rva          = getattr(args, "at_rva", None),
+            at_symbol       = args.at_symbol,
+            at_export       = getattr(args, "at_export", None),
+            at_pattern      = getattr(args, "at_pattern", None),
+            at_pattern_nth  = getattr(args, "at_pattern_nth", 1),
+            fmt             = fmt,
+            arch            = arch,
+            parsed          = parsed,
+            cc_override     = args.cc or "",
+            toolchain_hint  = args.toolchain,
+        )
+    except ValueError as e:
+        ap.error(f"Invalid address: {e}")
+
+    # ---- inject ----
+    inject(
+        binary_path, target_va, payload_path, out,
+        **common_inject,
     )
 
     if not args.dry_run:

@@ -78,3 +78,46 @@ def resolve_symbol_address(
         "The binary may be stripped or the symbol name may differ.\n"
         f"Provide --at explicitly, or check with:  {Path(nm_bin).name} {binary_path}"
     )
+
+
+# ---------------------------------------------------------------------------
+# PE export resolution (via LIEF — no nm needed)
+# ---------------------------------------------------------------------------
+
+def resolve_export_address(
+    binary_path: Path,
+    export_name: str,
+    parsed      = None,
+) -> int:
+    """
+    Resolve a PE exported function name to its virtual address.
+    Uses LIEF's export table parser — works on stripped binaries as long as
+    the export table is intact (common for DLLs).
+    Raises BpatchSymbolError if the export is not found.
+    """
+    import lief
+    from .errors import BpatchSymbolError
+
+    p = parsed if parsed is not None else lief.parse(str(binary_path))
+    if p is None or not isinstance(p, lief.PE.Binary):
+        raise BpatchSymbolError(
+            f"--at-export requires a PE binary, but {binary_path} could not be parsed as PE."
+        )
+
+    ib = p.optional_header.imagebase
+    for exp in p.exported_functions:
+        if exp.name == export_name:
+            va = ib + exp.address
+            info(f"[*] Resolved export {export_name!r} -> 0x{va:x}")
+            return va
+
+    # Build a short list of available exports for the error message
+    avail = [e.name for e in p.exported_functions]
+    sample = ", ".join(repr(n) for n in avail[:10])
+    if len(avail) > 10:
+        sample += f", ... ({len(avail)} total)"
+    raise BpatchSymbolError(
+        f"Export {export_name!r} not found in {binary_path.name}.\n"
+        f"Available exports: {sample or '(none)'}\n"
+        "Use --at-symbol for ELF debug symbols, or --at for a raw address."
+    )

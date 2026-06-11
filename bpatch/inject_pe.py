@@ -31,7 +31,8 @@ from pathlib import Path
 
 from .compiler import compile_payload
 from .errors import BpatchInjectError
-from .log import info, ok
+from .log import info, ok, warn
+from .undo import build_undo_header, UNDO_HDR_SIZE
 from .utils import align_up
 
 # Section header field offsets (within the 40-byte entry)
@@ -118,6 +119,23 @@ def _next_inj_name(existing: set[str], base: str = ".inj") -> str:
     raise BpatchInjectError("Could not allocate a unique injection section name")
 
 
+def _is_patched_pe(raw: bytes, patch_foff: int) -> bool:
+    """Return True if the bytes at *patch_foff* look like a JMP/B (already hooked)."""
+    if patch_foff + 5 > len(raw):
+        return False
+    b = raw[patch_foff]
+    if b in (0xE9, 0xEB):
+        return True
+    if b == 0xFF and patch_foff + 1 < len(raw) and raw[patch_foff + 1] == 0x25:
+        return True
+    # AArch64 B unconditional
+    if patch_foff + 4 <= len(raw):
+        word = int.from_bytes(raw[patch_foff:patch_foff + 4], "little")
+        if (word >> 26) == 0b000101:
+            return True
+    return False
+
+
 def _is_uncond_branch(ins) -> bool:
     return getattr(ins, "mnemonic", "").lower() in ("jmp", "b", "br")
 
@@ -125,12 +143,14 @@ def _is_uncond_branch(ins) -> bool:
 def _print_layout(tgt_va, inj_va, prologue, epilogue, payload,
                   ret_va, inj_label: str = ".inj") -> None:
     ok(f"\n[+] Injection layout:")
-    ok(f"    0x{tgt_va:016x}  JMP -> {inj_label}  (patch site)")
-    ok(f"    0x{inj_va:016x}  prologue  ({len(prologue)} bytes)")
-    e = inj_va + len(prologue)
+    ok(f"    0x{tgt_va:016x}  JMP -> {inj_label}+0x{UNDO_HDR_SIZE:x}  (patch site)")
+    ok(f"    0x{inj_va:016x}  [undo header]  ({UNDO_HDR_SIZE} bytes; bpatch --undo to revert)")
+    p = inj_va + UNDO_HDR_SIZE
+    ok(f"    0x{p:016x}  prologue  ({len(prologue)} bytes)")
+    e = p + len(prologue)
     ok(f"    0x{e:016x}  epilogue  ({len(epilogue)} bytes)  <- ret lands here")
-    p = e + len(epilogue)
-    ok(f"    0x{p:016x}  payload   ({len(payload)} bytes)")
+    c = e + len(epilogue)
+    ok(f"    0x{c:016x}  payload   ({len(payload)} bytes)")
     ok(f"    -> 0x{ret_va:016x}  resume original")
 
 
@@ -153,12 +173,13 @@ def inject_pe(
     debug:            bool = False,
     sections:         bool = False,
     dry_run:          bool = False,
+    chain:            bool = False,
 ) -> None:
     import lief  # local import
 
-    if arch != "x86_64":
+    if arch not in ("x86_64", "aarch64"):
         raise BpatchInjectError(
-            f"PE {arch} is not supported yet. Only PE x86_64 is supported."
+            f"PE {arch} is not supported. Supported: x86_64, aarch64."
         )
 
     parsed    = parsed_binary if parsed_binary is not None else lief.parse(str(binary_path))
@@ -207,11 +228,35 @@ def inject_pe(
 
     info("[*] Analyzing injection point...")
     backend = _get_backend(arch)
+
+    # --- safety: target RVA must have backing raw bytes ---
+    patch_foff       = sec_foff + (rva - tgt["va"])
+    patch_rva_offset = rva - tgt["va"]
+    if patch_rva_offset >= tgt["rawsz"]:
+        raise BpatchInjectError(
+            f"Target RVA 0x{rva:x} is in the virtual-only tail of section "
+            f"{tgt['name']!r} (rawsz=0x{tgt['rawsz']:x}, vsize=0x{tgt['vsize']:x}).\n"
+            "This address has no backing bytes on disk and cannot be patched."
+        )
+
+    # Detect already-patched sites
+    if _is_patched_pe(bytes(raw), patch_foff):
+        if not chain:
+            warn(
+                f"[!] 0x{target_va:x} already starts with a JMP — may already be hooked.\n"
+                "    Use --chain to inject anyway (new hook will chain through existing JMP)."
+            )
+        else:
+            info("[*] --chain: target already hooked; chaining new injection.")
+
     stolen, stolen_sz = backend.steal_insns(bytes(raw), target_va, sec_va, sec_foff)
     if stolen and _is_uncond_branch(stolen[0]):
         info("[*] Note: target begins with an unconditional branch; "
-             "re-patching will chain through previous hook code.")
+             "chaining through previous hook code.")
     return_va = target_va + stolen_sz
+
+    # Capture original bytes for undo header BEFORE patching
+    original_bytes = bytes(raw[patch_foff: patch_foff + stolen_sz])
     print()
 
     # --- choose injection placement ---
@@ -235,33 +280,29 @@ def inject_pe(
         info(f"[+] {inj_name} vaddr:          0x{inj_va:x}  (RVA 0x{inj_rva:x})")
         info(f"[+] {inj_name} foffset:        0x{inj_rawptr:x}")
 
+    # code_start = inj_va + UNDO_HDR_SIZE  (prologue begins after the header)
+    code_start = inj_va + UNDO_HDR_SIZE
     prologue, epilogue, content = backend.build_section_content(
-        inj_va, payload_bytes, payload_off, stolen, return_va, abi="win64"
+        code_start, payload_bytes, payload_off, stolen, return_va, abi="win64"
     )
 
-    inj_rawsz      = align_up(len(content), h["fa"])
-    content_padded = content + b"\x00" * (inj_rawsz - len(content))
+    # Full section: [undo_hdr(32)][prologue][epilogue][payload]
+    undo_hdr       = build_undo_header(target_va, original_bytes)
+    full_content   = undo_hdr + content
+    inj_rawsz      = align_up(len(full_content), h["fa"])
+    content_padded = full_content + b"\x00" * (inj_rawsz - len(full_content))
 
-    # --- safety: target RVA must have backing raw bytes ---
-    patch_foff      = sec_foff + (rva - tgt["va"])
-    patch_rva_offset = rva - tgt["va"]
-    if patch_rva_offset >= tgt["rawsz"]:
-        raise BpatchInjectError(
-            f"Target RVA 0x{rva:x} is in the virtual-only tail of section "
-            f"{tgt['name']!r} (rawsz=0x{tgt['rawsz']:x}, vsize=0x{tgt['vsize']:x}).\n"
-            "This address has no backing bytes on disk and cannot be patched."
-        )
-
-    full_patch, patch_len, nops = backend.make_entry_patch(target_va, inj_va, stolen_sz)
+    # JMP target = code_start (skips undo header)
+    full_patch, patch_len, nops = backend.make_entry_patch(target_va, code_start, stolen_sz)
     raw[patch_foff: patch_foff + len(full_patch)] = full_patch
-    info(f"[*] patching 0x{target_va:x}  JMP -> 0x{inj_va:x}  "
+    info(f"[*] patching 0x{target_va:x}  JMP -> 0x{code_start:x}  "
          f"({patch_len}B patch + {nops} NOP{'s' if nops != 1 else ''})")
 
     if can_add_section:
         name_bytes = inj_name.encode("ascii", errors="strict").ljust(8, b"\x00")
         new_hdr = (
             name_bytes
-            + struct.pack("<I", len(content))    # VirtualSize
+            + struct.pack("<I", len(full_content))  # VirtualSize (hdr+code)
             + struct.pack("<I", inj_rva)         # VirtualAddress
             + struct.pack("<I", inj_rawsz)       # SizeOfRawData
             + struct.pack("<I", inj_rawptr)      # PointerToRawData
@@ -277,7 +318,7 @@ def inject_pe(
     else:
         inj_off_in_host = inj_rawptr - host_sec["rawptr"]
         new_host_rawsz  = max(host_sec["rawsz"], inj_off_in_host + inj_rawsz)
-        new_host_vsize  = max(host_sec["vsize"], inj_off_in_host + len(content))
+        new_host_vsize  = max(host_sec["vsize"], inj_off_in_host + len(full_content))
         new_host_chars  = host_sec["chars"] | _SEC_EXEC
         struct.pack_into("<I", raw, host_sec["base"] + _SEC_VSIZE, new_host_vsize)
         struct.pack_into("<I", raw, host_sec["base"] + _SEC_RAWSZ, new_host_rawsz)

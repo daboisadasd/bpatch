@@ -17,7 +17,10 @@ from pathlib import Path
 
 from .errors import BpatchCompileError
 from .log import info, ok
-from .runtime import BPATCH_RT_LINUX_H, BPATCH_RT_WIN64_H, BPATCH_RT_AARCH64_LINUX_H
+from .runtime import (
+    BPATCH_RT_LINUX_H, BPATCH_RT_WIN64_H,
+    BPATCH_RT_AARCH64_LINUX_H, BPATCH_RT_WIN_ARM64_H,
+)
 from .runtime import _WRAPPER, _LINKER_SCRIPT
 from .toolchain import (
     find_toolchain,
@@ -40,11 +43,14 @@ _BAD_RELOCS_AARCH64 = frozenset({
 
 def _rt_header(pe: bool, arch: str) -> str:
     if pe:
-        if arch != "x86_64":
-            raise BpatchCompileError(
-                f"PE payload runtime for arch {arch!r} is not supported."
-            )
-        return BPATCH_RT_WIN64_H
+        if arch == "x86_64":
+            return BPATCH_RT_WIN64_H
+        if arch == "aarch64":
+            return BPATCH_RT_WIN_ARM64_H
+        raise BpatchCompileError(
+            f"PE payload runtime for arch {arch!r} is not supported. "
+            "Supported: x86_64, aarch64."
+        )
     if arch == "x86_64":
         return BPATCH_RT_LINUX_H
     if arch == "aarch64":
@@ -192,6 +198,10 @@ def compile_payload(
             # relocations that overflow when the injection section is far from imagebase.
             flags += ["-fno-exceptions", "-fno-unwind-tables",
                       "-fno-asynchronous-unwind-tables"]
+    elif arch == "aarch64" and pe:
+        # Same reasoning as x86_64 PE: strip .pdata/.xdata unwind entries
+        flags += ["-fno-exceptions", "-fno-unwind-tables",
+                  "-fno-asynchronous-unwind-tables"]
 
     if lto:
         flags.append("-flto")
@@ -297,9 +307,12 @@ def compile_payload(
     )
     data = binf.read_bytes().rstrip(b"\x00") + b"\x00"
 
-    # Use nm on the linked ELF (not the .o) — this is correct for both regular
-    # builds and LTO builds (bitcode .o files give "----------------" addresses).
-    payload_offset = find_payload_offset(nm_bin, linked)
+    # Decide which binary to run nm on:
+    #  - LTO + ELF linker: nm on the linked output (bitcode .o gives "--------")
+    #  - PE build:         nm on the .o (linked output is PE COFF — nm gives wrong VAs)
+    #  - Non-LTO:          nm on the .o is always correct
+    nm_target = linked if (lto and not pe) else obj
+    payload_offset = find_payload_offset(nm_bin, nm_target)
     ok(f"[+] payload compiled: {len(data)} bytes  "
        f"(text+rodata flat binary, payload() at +0x{payload_offset:x})")
     return data, payload_offset
